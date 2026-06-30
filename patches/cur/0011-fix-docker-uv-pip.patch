@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: patch automation <patch-automation@example.invalid>
-Date: Tue, 30 Jun 2026 09:35:24 +0000
-Subject: [PATCH] fix: install Docker dependencies with uv pip
+From: Ovler <44089074+Ovler-Young@users.noreply.github.com>
+Date: Tue, 30 Jun 2026 11:16:17 +0000
+Subject: [PATCH] build: install Docker dependencies with uv
 
 
 diff --git a/Dockerfile b/Dockerfile
-index 8e90f20..ed1587f 100644
+index 8e90f20..68c5951 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -7,7 +7,6 @@ ENV TZ=Asia/Shanghai \
@@ -16,7 +16,7 @@ index 8e90f20..ed1587f 100644
      BTB_SERVER_NAME=0.0.0.0 \
      GRADIO_SERVER_PORT=7860 \
      GRADIO_NUM_PORTS=100 \
-@@ -29,20 +28,16 @@ RUN apt-get update && \
+@@ -29,15 +28,10 @@ RUN apt-get update && \
      fc-cache -f && \
      rm -rf /var/lib/apt/lists/*
  
@@ -34,23 +34,11 @@ index 8e90f20..ed1587f 100644
      python - <<'PY'
  import fastapi
  import gradio
- import jinja2
- import starlette
-+import tyro
- 
- print(
-     "Resolved runtime versions:",
-@@ -51,10 +46,13 @@ print(
-         "fastapi": fastapi.__version__,
-         "starlette": starlette.__version__,
-         "jinja2": jinja2.__version__,
-+        "tyro": tyro.__version__,
-     },
+@@ -55,6 +49,7 @@ print(
  )
  PY
  
 +COPY . .
-+
  EXPOSE 7860
  
  CMD ["python", "main.py"]
