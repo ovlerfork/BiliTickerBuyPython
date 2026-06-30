@@ -5,6 +5,7 @@ from task.buy import (
     _CreateFanoutResult,
     _create_fanout_lane,
     _find_successful_fanout_result,
+    _mark_failed_fanout_lane,
     _run_create_fanout_round,
 )
 from util.request.exceptions import BiliRateLimitError
@@ -34,6 +35,19 @@ class FakeRequest:
         return self.response
 
 
+class ThresholdRequest(FakeRequest):
+    def __init__(self, threshold: int):
+        super().__init__()
+        self.threshold = threshold
+        self.failures = 0
+        self.reasons: list[str] = []
+
+    def mark_current_proxy_failure(self, reason: str) -> bool:
+        self.failures += 1
+        self.reasons.append(reason)
+        return self.failures >= self.threshold
+
+
 def test_fanout_round_reports_successful_lane():
     request = FakeRequest(FakeResponse(200, {"errno": 0, "data": {"orderId": 1}}))
     lane = _CreateFanoutLane("http://p1:1", request)
@@ -52,6 +66,33 @@ def test_fanout_round_reports_successful_lane():
     assert results[0].err == 0
     assert results[0].ret == {"errno": 0, "data": {"orderId": 1}}
     assert request.calls == 1
+
+
+def test_fanout_lane_failure_uses_threshold_before_cooling():
+    request = ThresholdRequest(threshold=2)
+    lane = _CreateFanoutLane("http://p1:1", request)
+    cooling_lanes = []
+
+    assert not _mark_failed_fanout_lane(
+        lane,
+        cooling_lanes=cooling_lanes,
+        fanout_412_action="cooldown",
+        cooldown_seconds=60,
+        reason="network failure",
+    )
+    assert cooling_lanes == []
+
+    assert _mark_failed_fanout_lane(
+        lane,
+        cooling_lanes=cooling_lanes,
+        fanout_412_action="cooldown",
+        cooldown_seconds=60,
+        reason="network failure",
+    )
+    assert request.failures == 2
+    assert request.reasons == ["network failure", "network failure"]
+    assert len(cooling_lanes) == 1
+    assert cooling_lanes[0].lane is lane
 
 
 def test_fanout_round_keeps_rate_limit_as_lane_result():
