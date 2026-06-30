@@ -1,0 +1,54 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  sync:
+    name: Sync Main And Check Patches
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout control branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select control branch
+        run: git switch dev
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync main from upstream
+        id: sync
+        env:
+          CONTROL_REF: dev
+          MAIN_REF: main
+          LATEST_REF: latest
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/sync-main-from-upstream.sh
+
+      - name: Check patches against synced main
+        env:
+          CONTROL_REF: dev
+          MAIN_REF: main
+          LATEST_REF: latest
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/check-patches.sh
+
+      - name: Trigger patch release
+        if: steps.sync.outputs.version_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run patch-release.yml --ref dev -f reason=upstream-version-bump

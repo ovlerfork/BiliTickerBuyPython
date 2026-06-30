@@ -1,0 +1,40 @@
+name: Patch Check
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+    branches:
+      - dev
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check Patch Stack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout control branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Select control branch
+        run: git switch dev
+
+      - name: Check patches
+        env:
+          CONTROL_REF: dev
+          MAIN_REF: main
+          LATEST_REF: latest
+        run: bash scripts/check-patches.sh
