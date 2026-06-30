@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patch automation <patch-automation@example.invalid>
+Date: Tue, 30 Jun 2026 08:41:30 +0000
+Subject: [PATCH 2/3] fix queue proxy fanout allocation
+
+
+diff --git a/tab/go.py b/tab/go.py
+index d3e009f..201170f 100644
+--- a/tab/go.py
++++ b/tab/go.py
+@@ -104,20 +104,22 @@ def _queue_worker_count(
+     multiplier: int,
+     fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+ ) -> int:
+-    if queue_concurrency_limit > 0:
+-        return max(1, min(file_count, queue_concurrency_limit))
+     fill_strategy = normalize_queue_proxy_fanout_fill_strategy(fill_strategy)
+     if (
+         fanout_enabled
+         and _fanout_strategy_uses_api(fill_strategy)
+         and str(proxy_api_url or "").strip()
+     ):
+-        return max(1, file_count)
+-    if fanout_enabled and _fanout_strategy_uses_direct(fill_strategy):
+-        return max(1, file_count)
+-    if fanout_enabled:
+-        return max(1, min(file_count, max(1, proxy_count // max(1, multiplier))))
+-    return max(1, min(file_count, max(1, proxy_count)))
++        worker_count = file_count
++    elif fanout_enabled and _fanout_strategy_uses_direct(fill_strategy):
++        worker_count = file_count
++    elif fanout_enabled:
++        worker_count = min(file_count, proxy_count // max(1, multiplier))
++    else:
++        worker_count = min(file_count, max(1, proxy_count))
++    if queue_concurrency_limit > 0:
++        worker_count = min(worker_count, queue_concurrency_limit)
++    return max(0 if fanout_enabled else 1, worker_count)
+ 
+ 
+ def _fanout_strategy_uses_pool(strategy: str) -> bool:
+@@ -527,22 +529,26 @@ def go_start_tab():
+                     fill_strategy=queue_proxy_fanout_fill_strategy,
+                 )
+ 
+-                def queue_worker():
++                worker_proxy_groups: list[list[str]] = []
++                for worker_idx in range(worker_count):
++                    assigned, proxy_error = proxy_allocator.allocate()
++                    if proxy_error:
++                        logger.error(
++                            "队列多代理 worker {} 未启动：{}，已分配 {}/{} 个代理",
++                            worker_idx + 1,
++                            proxy_error,
++                            len(assigned),
++                            queue_proxy_multiplier,
++                        )
++                        continue
++                    worker_proxy_groups.append(assigned)
++
++                def queue_worker(assigned: list[str]):
+                     while True:
+                         with pending_lock:
+                             if not pending_files:
+                                 return
+                             current_file = pending_files.pop(0)
+-                        assigned, proxy_error = proxy_allocator.allocate()
+-                        if proxy_error:
+-                            logger.error(
+-                                "任务 {} 未启动：{}，已分配 {}/{} 个代理",
+-                                os.path.basename(current_file),
+-                                proxy_error,
+-                                len(assigned),
+-                                queue_proxy_multiplier,
+-                            )
+-                            continue
+                         try:
+                             proc = launch_task(
+                                 current_file,
+@@ -554,9 +560,10 @@ def go_start_tab():
+                         except Exception as exc:
+                             logger.exception(exc)
+ 
+-                for worker_idx in range(worker_count):
++                for worker_idx, assigned in enumerate(worker_proxy_groups):
+                     threading.Thread(
+                         target=queue_worker,
++                        args=(assigned,),
+                         name=f"btb-queue-worker-{worker_idx + 1}",
+                         daemon=True,
+                     ).start()
+diff --git a/task/buy.py b/task/buy.py
+index ff542fa..4b7b384 100644
+--- a/task/buy.py
++++ b/task/buy.py
+@@ -17,10 +17,7 @@ import qrcode
+ from loguru import logger
+ 
+ from requests import HTTPError, RequestException
+-from cptoken import (
+-    generate_browser_window_state,
+-    init_ctoken_state,
+-)
++from cptoken import init_ctoken_state
+ 
+ from app_cmd.config.BuyConfig import BuyConfig
+ from app_cmd.config.QueueProxyFanoutPolicy import (
+@@ -233,6 +230,26 @@ class _CoolingFanoutLane:
+     ready_at: float
+ 
+ 
++def _create_fanout_lane(
++    proxy: str,
++    *,
++    cookies,
++    browser_state: dict[str, Any],
++    proxy_failure_threshold: int,
++    proxy_cooldown_seconds: int | float,
++) -> _CreateFanoutLane:
++    return _CreateFanoutLane(
++        proxy=proxy,
++        request=BiliRequest(
++            cookies=cookies,
++            proxy=proxy,
++            browser_state=browser_state,
++            proxy_failure_threshold=proxy_failure_threshold,
++            proxy_cooldown_seconds=proxy_cooldown_seconds,
++        ),
++    )
++
++
+ def _find_successful_fanout_result(
+     results: list[_CreateFanoutResult],
+ ) -> _CreateFanoutResult | None:
+@@ -501,7 +518,7 @@ def buy_stream(config: BuyConfig):
+     proxy_backoff = ProxyBackoff(max_seconds=config.proxy_backoff_max_seconds)
+     is_hot_project = bool(tickets_info.get("is_hot_project", False))
+     # use_local_token = bool(config.use_local_token)
+-    browser_window_state = generate_browser_window_state()
++    browser_window_state = _request.browser_state["window"]
+     token_payload = _build_token_payload(tickets_info)
+     request_interval = max(1, int(config.interval or 1000))
+     effective_retry_limit = max(1, int(config.create_retry_limit))
+@@ -527,14 +544,12 @@ def buy_stream(config: BuyConfig):
+     ]
+ 
+     def create_fanout_lane(proxy: str) -> _CreateFanoutLane:
+-        return _CreateFanoutLane(
++        return _create_fanout_lane(
+             proxy=proxy,
+-            request=BiliRequest(
+-                cookies=cookies,
+-                proxy=proxy,
+-                proxy_failure_threshold=config.proxy_max_consecutive_failures,
+-                proxy_cooldown_seconds=config.proxy_cooldown_seconds,
+-            ),
++            cookies=cookies,
++            browser_state=_request.browser_state,
++            proxy_failure_threshold=config.proxy_max_consecutive_failures,
++            proxy_cooldown_seconds=config.proxy_cooldown_seconds,
+         )
+ 
+     def add_fanout_proxy(proxy: str, *, allow_direct: bool = False) -> bool:
+diff --git a/tests/test_buy_fanout.py b/tests/test_buy_fanout.py
+index f1262f5..9b331ee 100644
+--- a/tests/test_buy_fanout.py
++++ b/tests/test_buy_fanout.py
+@@ -3,6 +3,7 @@ from json import JSONDecodeError
+ from task.buy import (
+     _CreateFanoutLane,
+     _CreateFanoutResult,
++    _create_fanout_lane,
+     _find_successful_fanout_result,
+     _run_create_fanout_round,
+ )
+@@ -120,3 +121,22 @@ def test_fanout_success_detector_returns_none_without_success():
+     )
+ 
+     assert _find_successful_fanout_result([terminal]) is None
++
++
++def test_create_fanout_lane_reuses_main_browser_state():
++    browser_state = {
++        "navigator": {"userAgent": "Mozilla/5.0 TestBrowser/1.0"},
++        "location": {"origin": "https://show.bilibili.com"},
++        "storage": {},
++    }
++
++    lane = _create_fanout_lane(
++        "http://p1:1",
++        cookies=[],
++        browser_state=browser_state,
++        proxy_failure_threshold=2,
++        proxy_cooldown_seconds=180,
++    )
++
++    assert lane.request.browser_state is browser_state
++    assert lane.request.get_user_agent() == "Mozilla/5.0 TestBrowser/1.0"
+diff --git a/tests/test_queue_proxy_allocator.py b/tests/test_queue_proxy_allocator.py
+index e913037..0a790c1 100644
+--- a/tests/test_queue_proxy_allocator.py
++++ b/tests/test_queue_proxy_allocator.py
+@@ -126,6 +126,36 @@ def test_fanout_queue_pool_strategy_ignores_proxy_api_for_worker_count():
+     )
+ 
+ 
++def test_fanout_queue_pool_strategy_reuses_proxy_groups_for_more_files():
++    assert (
++        _queue_worker_count(
++            file_count=5,
++            queue_concurrency_limit=0,
++            proxy_count=2,
++            fanout_enabled=True,
++            proxy_api_url="",
++            multiplier=2,
++            fill_strategy="pool",
++        )
++        == 1
++    )
++
++
++def test_fanout_queue_pool_strategy_clamps_explicit_limit_to_proxy_groups():
++    assert (
++        _queue_worker_count(
++            file_count=5,
++            queue_concurrency_limit=5,
++            proxy_count=4,
++            fanout_enabled=True,
++            proxy_api_url="",
++            multiplier=2,
++            fill_strategy="pool",
++        )
++        == 2
++    )
++
++
+ def test_fanout_queue_without_api_uses_all_files_when_direct_is_allowed():
+     assert (
+         _queue_worker_count(

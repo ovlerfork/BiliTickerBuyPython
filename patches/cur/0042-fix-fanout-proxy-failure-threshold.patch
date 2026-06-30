@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patch automation <patch-automation@example.invalid>
+Date: Tue, 30 Jun 2026 09:08:19 +0000
+Subject: [PATCH 3/3] fix fanout proxy failure threshold
+
+
+diff --git a/task/buy.py b/task/buy.py
+index 4b7b384..5dcceeb 100644
+--- a/task/buy.py
++++ b/task/buy.py
+@@ -320,6 +320,26 @@ def _run_create_fanout_round(
+     return results
+ 
+ 
++def _mark_failed_fanout_lane(
++    lane: _CreateFanoutLane,
++    *,
++    cooling_lanes: list[_CoolingFanoutLane],
++    fanout_412_action: str,
++    cooldown_seconds: int | float,
++    reason: str,
++) -> bool:
++    if not lane.request.mark_current_proxy_failure(reason):
++        return False
++    if fanout_412_action == "cooldown":
++        cooling_lanes.append(
++            _CoolingFanoutLane(
++                lane=lane,
++                ready_at=time.time() + max(1, int(cooldown_seconds)),
++            )
++        )
++    return True
++
++
+ def buy_stream(config: BuyConfig):
+     state = BuyStreamState()
+ 
+@@ -947,6 +967,22 @@ def buy_stream(config: BuyConfig):
+ 
+                         if fanout_result.exc is not None:
+                             retry_outcome.set_exception(fanout_result.exc)
++                            if isinstance(
++                                fanout_result.exc,
++                                (BiliConnectionError, RequestException),
++                            ) and fanout_result.lane not in removed_lanes:
++                                failure_reason = (
++                                    "创建订单请求异常"
++                                    f"({fanout_result.exc.__class__.__name__})"
++                                )
++                                if _mark_failed_fanout_lane(
++                                    fanout_result.lane,
++                                    cooling_lanes=fanout_cooling_lanes,
++                                    fanout_412_action=fanout_412_action,
++                                    cooldown_seconds=config.proxy_cooldown_seconds,
++                                    reason=failure_reason,
++                                ):
++                                    removed_lanes.append(fanout_result.lane)
+                             if response is not None:
+                                 diagnostic = (
+                                     fanout_result.lane.request.describe_non_json_response(
+diff --git a/tests/test_buy_fanout.py b/tests/test_buy_fanout.py
+index 9b331ee..5ef82d3 100644
+--- a/tests/test_buy_fanout.py
++++ b/tests/test_buy_fanout.py
+@@ -5,6 +5,7 @@ from task.buy import (
+     _CreateFanoutResult,
+     _create_fanout_lane,
+     _find_successful_fanout_result,
++    _mark_failed_fanout_lane,
+     _run_create_fanout_round,
+ )
+ from util.request.exceptions import BiliRateLimitError
+@@ -34,6 +35,19 @@ class FakeRequest:
+         return self.response
+ 
+ 
++class ThresholdRequest(FakeRequest):
++    def __init__(self, threshold: int):
++        super().__init__()
++        self.threshold = threshold
++        self.failures = 0
++        self.reasons: list[str] = []
++
++    def mark_current_proxy_failure(self, reason: str) -> bool:
++        self.failures += 1
++        self.reasons.append(reason)
++        return self.failures >= self.threshold
++
++
+ def test_fanout_round_reports_successful_lane():
+     request = FakeRequest(FakeResponse(200, {"errno": 0, "data": {"orderId": 1}}))
+     lane = _CreateFanoutLane("http://p1:1", request)
+@@ -54,6 +68,33 @@ def test_fanout_round_reports_successful_lane():
+     assert request.calls == 1
+ 
+ 
++def test_fanout_lane_failure_uses_threshold_before_cooling():
++    request = ThresholdRequest(threshold=2)
++    lane = _CreateFanoutLane("http://p1:1", request)
++    cooling_lanes = []
++
++    assert not _mark_failed_fanout_lane(
++        lane,
++        cooling_lanes=cooling_lanes,
++        fanout_412_action="cooldown",
++        cooldown_seconds=60,
++        reason="network failure",
++    )
++    assert cooling_lanes == []
++
++    assert _mark_failed_fanout_lane(
++        lane,
++        cooling_lanes=cooling_lanes,
++        fanout_412_action="cooldown",
++        cooldown_seconds=60,
++        reason="network failure",
++    )
++    assert request.failures == 2
++    assert request.reasons == ["network failure", "network failure"]
++    assert len(cooling_lanes) == 1
++    assert cooling_lanes[0].lane is lane
++
++
+ def test_fanout_round_keeps_rate_limit_as_lane_result():
+     exc = BiliRateLimitError("请求被限流(HTTP 429)")
+     request = FakeRequest(exc=exc)
