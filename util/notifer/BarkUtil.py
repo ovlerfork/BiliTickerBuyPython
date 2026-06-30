@@ -1,7 +1,7 @@
 import json
 import requests
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from util.notifer.Notifier import NotifierBase
 
 
@@ -20,12 +20,26 @@ class BarkNotifier(NotifierBase):
             "level": "critical",  # 重要警告
             "volume": "10",
         }
-        if isinstance(self.token, str) and urlparse(self.token).scheme in {
-            "http",
-            "https",
-        }:
-            url = f"{self.token.rstrip('/')}/{title}/{message}"
-        else:
-            url = f"https://api.day.app/{self.token}/{title}/{message}"
+        encoded_title = quote(str(title), safe="")
+        encoded_message = quote(str(message), safe="")
+        token_text = str(self.token or "").strip()
 
-        requests.post(url, headers=headers, data=json.dumps(data))
+        if not token_text:
+            raise ValueError("Bark token is required")
+
+        if urlparse(token_text).scheme in {"http", "https"}:
+            url = f"{token_text.rstrip('/')}/{encoded_title}/{encoded_message}"
+        else:
+            token = quote(token_text.strip("/"), safe="")
+            url = f"https://api.day.app/{token}/{encoded_title}/{encoded_message}"
+
+        response = requests.post(url, headers=headers, data=json.dumps(data), timeout=10)
+        response.raise_for_status()
+
+        try:
+            result = response.json()
+        except ValueError:
+            return
+
+        if result.get("code") != 200:
+            raise RuntimeError(f"Bark push failed: {result}")
