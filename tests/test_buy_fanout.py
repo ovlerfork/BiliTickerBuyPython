@@ -3,6 +3,7 @@ from json import JSONDecodeError
 from task.buy import (
     _CreateFanoutLane,
     _CreateFanoutResult,
+    _create_fanout_lane,
     _find_successful_fanout_result,
     _run_create_fanout_round,
 )
@@ -120,3 +121,22 @@ def test_fanout_success_detector_returns_none_without_success():
     )
 
     assert _find_successful_fanout_result([terminal]) is None
+
+
+def test_create_fanout_lane_reuses_main_browser_state():
+    browser_state = {
+        "navigator": {"userAgent": "Mozilla/5.0 TestBrowser/1.0"},
+        "location": {"origin": "https://show.bilibili.com"},
+        "storage": {},
+    }
+
+    lane = _create_fanout_lane(
+        "http://p1:1",
+        cookies=[],
+        browser_state=browser_state,
+        proxy_failure_threshold=2,
+        proxy_cooldown_seconds=180,
+    )
+
+    assert lane.request.browser_state is browser_state
+    assert lane.request.get_user_agent() == "Mozilla/5.0 TestBrowser/1.0"
