@@ -307,7 +307,9 @@ def go_start_tab():
         ConfigDB.insert("requestInterval", interval)
 
         https_proxys = ConfigDB.get("https_proxy") or ""
-        https_proxy_list = ["none"] + https_proxys.split(",")
+        https_proxy_list = [
+            proxy.strip() for proxy in https_proxys.split(",") if proxy.strip()
+        ] or ["none"]
         assigned_proxies: list[list[str]] = []
         assigned_proxies_next_idx = 0
         # 从配置文件加载
