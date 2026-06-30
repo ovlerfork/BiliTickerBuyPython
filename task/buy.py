@@ -17,10 +17,7 @@ import qrcode
 from loguru import logger
 
 from requests import HTTPError, RequestException
-from cptoken import (
-    generate_browser_window_state,
-    init_ctoken_state,
-)
+from cptoken import init_ctoken_state
 
 from app_cmd.config.BuyConfig import BuyConfig
 from app_cmd.config.QueueProxyFanoutPolicy import (
@@ -231,6 +228,26 @@ class _CreateFanoutResult:
 class _CoolingFanoutLane:
     lane: _CreateFanoutLane
     ready_at: float
+
+
+def _create_fanout_lane(
+    proxy: str,
+    *,
+    cookies,
+    browser_state: dict[str, Any],
+    proxy_failure_threshold: int,
+    proxy_cooldown_seconds: int | float,
+) -> _CreateFanoutLane:
+    return _CreateFanoutLane(
+        proxy=proxy,
+        request=BiliRequest(
+            cookies=cookies,
+            proxy=proxy,
+            browser_state=browser_state,
+            proxy_failure_threshold=proxy_failure_threshold,
+            proxy_cooldown_seconds=proxy_cooldown_seconds,
+        ),
+    )
 
 
 def _find_successful_fanout_result(
@@ -501,7 +518,7 @@ def buy_stream(config: BuyConfig):
     proxy_backoff = ProxyBackoff(max_seconds=config.proxy_backoff_max_seconds)
     is_hot_project = bool(tickets_info.get("is_hot_project", False))
     # use_local_token = bool(config.use_local_token)
-    browser_window_state = generate_browser_window_state()
+    browser_window_state = _request.browser_state["window"]
     token_payload = _build_token_payload(tickets_info)
     request_interval = max(1, int(config.interval or 1000))
     effective_retry_limit = max(1, int(config.create_retry_limit))
@@ -527,14 +544,12 @@ def buy_stream(config: BuyConfig):
     ]
 
     def create_fanout_lane(proxy: str) -> _CreateFanoutLane:
-        return _CreateFanoutLane(
+        return _create_fanout_lane(
             proxy=proxy,
-            request=BiliRequest(
-                cookies=cookies,
-                proxy=proxy,
-                proxy_failure_threshold=config.proxy_max_consecutive_failures,
-                proxy_cooldown_seconds=config.proxy_cooldown_seconds,
-            ),
+            cookies=cookies,
+            browser_state=_request.browser_state,
+            proxy_failure_threshold=config.proxy_max_consecutive_failures,
+            proxy_cooldown_seconds=config.proxy_cooldown_seconds,
         )
 
     def add_fanout_proxy(proxy: str, *, allow_direct: bool = False) -> bool:
