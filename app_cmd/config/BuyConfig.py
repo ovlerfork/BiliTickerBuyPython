@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import os
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from app_cmd.config.ConfigBasic import (
     BasicConfig,
@@ -12,6 +12,12 @@ from app_cmd.config.ConfigBasic import (
     str_to_bool,
 )
 from app_cmd.config.NotifierConfig import NotifierConfig
+from app_cmd.config.QueueProxyFanoutPolicy import (
+    QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT,
+    QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+    normalize_queue_proxy_fanout_412_action,
+    normalize_queue_proxy_fanout_fill_strategy,
+)
 from util.Constant import DEFAULT_RATE_LIMIT_DELAY_MS
 from util.h2client.constants import H2CLIENT_CONNECTIONS_PER_SOURCE_IP
 
@@ -88,6 +94,46 @@ class BuyConfig(BasicConfig):
         cast=int,
     )
     """Number of proxies requested from the API; 0 follows the current pool size."""
+
+    queue_proxy_fanout_enabled: bool = config_field(
+        False,
+        env="BTB_QUEUE_PROXY_FANOUT_ENABLED",
+        runtime="queue_proxy_fanout_enabled",
+        db="queueProxyFanoutEnabled",
+        cast=str_to_bool,
+        cli_true="--queue-proxy-fanout-enabled",
+    )
+    """Use multiple proxy lanes per queued ticket task."""
+
+    queue_proxy_multiplier: int = config_field(
+        1,
+        env="BTB_QUEUE_PROXY_MULTIPLIER",
+        runtime="queue_proxy_multiplier",
+        db="queueProxyMultiplier",
+        cli="--queue-proxy-multiplier",
+        cast=int,
+    )
+    """Number of proxy lanes per queued ticket task."""
+
+    queue_proxy_fanout_fill_strategy: str = config_field(
+        QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+        env="BTB_QUEUE_PROXY_FANOUT_FILL_STRATEGY",
+        runtime="queue_proxy_fanout_fill_strategy",
+        db="queueProxyFanoutFillStrategy",
+        cli="--queue-proxy-fanout-fill-strategy",
+        cast=normalize_queue_proxy_fanout_fill_strategy,
+    )
+    """Sources used to fill fan-out proxy lanes."""
+
+    queue_proxy_fanout_412_action: str = config_field(
+        QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT,
+        env="BTB_QUEUE_PROXY_FANOUT_412_ACTION",
+        runtime="queue_proxy_fanout_412_action",
+        db="queueProxyFanout412Action",
+        cli="--queue-proxy-fanout-412-action",
+        cast=normalize_queue_proxy_fanout_412_action,
+    )
+    """How fan-out lanes react after HTTP 412 risk control."""
 
     # ConfigDB 里原字段是 hideRandomMessage，语义和 show_random_message 相反
     show_random_message: bool = config_field(

@@ -9,6 +9,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app_cmd.config.QueueProxyFanoutPolicy import (
+    QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT,
+    QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+    normalize_queue_proxy_fanout_412_action,
+    normalize_queue_proxy_fanout_fill_strategy,
+)
 from util.h2client.constants import H2CLIENT_CONNECTIONS_PER_SOURCE_IP
 
 from .common import (
@@ -44,6 +50,10 @@ class RuntimeOptions:
     proxy_api_url: str = ""
     proxy_api_protocol: str = "http"
     proxy_api_request_count: int = 0
+    queue_proxy_fanout_enabled: bool = False
+    queue_proxy_multiplier: int = 1
+    queue_proxy_fanout_fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT
+    queue_proxy_fanout_412_action: str = QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT
     serverchan3ApiUrl: str = ""
     ntfy_url: str = ""
     ntfy_username: str = ""
@@ -209,6 +219,12 @@ def normalize_non_negative_interval(value: Any, *, default: int = 0) -> int:
     return max(0, int(round(amount * multiplier)))
 
 
+def normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def normalize_positive_int(value: Any, *, default: int) -> int:
     if value in (None, ""):
         return default
@@ -317,6 +333,10 @@ def build_runtime_options(
     proxy_api_url: str = "",
     proxy_api_protocol: str = "http",
     proxy_api_request_count: int = 0,
+    queue_proxy_fanout_enabled: bool = False,
+    queue_proxy_multiplier: int = 1,
+    queue_proxy_fanout_fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+    queue_proxy_fanout_412_action: str = QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT,
     serverchan3ApiUrl: str = "",
     ntfy_url: str = "",
     ntfy_username: str = "",
@@ -365,6 +385,17 @@ def build_runtime_options(
         proxy_api_request_count=normalize_non_negative_interval(
             proxy_api_request_count,
             default=0,
+        ),
+        queue_proxy_fanout_enabled=normalize_bool(queue_proxy_fanout_enabled),
+        queue_proxy_multiplier=normalize_positive_int(
+            queue_proxy_multiplier,
+            default=1,
+        ),
+        queue_proxy_fanout_fill_strategy=normalize_queue_proxy_fanout_fill_strategy(
+            queue_proxy_fanout_fill_strategy,
+        ),
+        queue_proxy_fanout_412_action=normalize_queue_proxy_fanout_412_action(
+            queue_proxy_fanout_412_action,
         ),
         serverchan3ApiUrl=serverchan3ApiUrl,
         ntfy_url=ntfy_url,

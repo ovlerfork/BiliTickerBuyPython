@@ -7,9 +7,11 @@ import time
 import uuid
 import copy
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Generator
 from dataclasses import dataclass
 from json import JSONDecodeError
+from typing import Any
 import shutil
 import qrcode
 from loguru import logger
@@ -21,6 +23,13 @@ from cptoken import (
 )
 
 from app_cmd.config.BuyConfig import BuyConfig
+from app_cmd.config.QueueProxyFanoutPolicy import (
+    normalize_queue_proxy_fanout_412_action,
+    normalize_queue_proxy_fanout_fill_strategy,
+    queue_proxy_fanout_strategy_uses_api,
+    queue_proxy_fanout_strategy_uses_direct,
+    queue_proxy_fanout_strategy_uses_pool,
+)
 from interface.project import fetch_project_payload
 from util.notifer.Notifier import NotifierManager
 from util.proxy.ProxyBackoff import ProxyBackoff
@@ -204,6 +213,98 @@ def _extract_prepare_token(result: dict | None) -> str | None:
 
 def _format_reprepare_reason(reason: str) -> str:
     return f"重新准备订单，原因：{reason}"
+
+
+@dataclass(slots=True)
+class _CreateFanoutLane:
+    proxy: str
+    request: BiliRequest
+
+
+@dataclass(slots=True)
+class _CreateFanoutResult:
+    lane: _CreateFanoutLane
+    attempt: int
+    response: Any | None = None
+    ret: dict | None = None
+    err: int | None = None
+    exc: Exception | None = None
+
+
+@dataclass(slots=True)
+class _CoolingFanoutLane:
+    lane: _CreateFanoutLane
+    ready_at: float
+
+
+def _find_successful_fanout_result(
+    results: list[_CreateFanoutResult],
+) -> _CreateFanoutResult | None:
+    for result in sorted(results, key=lambda item: item.attempt):
+        if result.exc is not None:
+            continue
+        ret = result.ret or {}
+        err = int(result.err if result.err is not None else -1)
+        if _is_create_success(ret, err):
+            return result
+    return None
+
+
+def _send_create_fanout_request(
+    lane: _CreateFanoutLane,
+    *,
+    attempt: int,
+    url: str,
+    payload: dict,
+) -> _CreateFanoutResult:
+    try:
+        response = lane.request.post(url=url, data=payload, isJson=True)
+        try:
+            ret = response.json()
+        except JSONDecodeError as exc:
+            return _CreateFanoutResult(
+                lane=lane,
+                attempt=attempt,
+                response=response,
+                exc=exc,
+            )
+        return _CreateFanoutResult(
+            lane=lane,
+            attempt=attempt,
+            response=response,
+            ret=ret,
+            err=int(ret.get("errno", ret.get("code"))),
+        )
+    except Exception as exc:
+        return _CreateFanoutResult(lane=lane, attempt=attempt, exc=exc)
+
+
+def _run_create_fanout_round(
+    lanes: list[_CreateFanoutLane],
+    *,
+    attempt: int,
+    attempt_limit: int,
+    url: str,
+    payload: dict,
+) -> list[_CreateFanoutResult]:
+    selected_lanes = lanes[: max(0, attempt_limit - attempt + 1)]
+    if not selected_lanes:
+        return []
+    results: list[_CreateFanoutResult] = []
+    with ThreadPoolExecutor(max_workers=len(selected_lanes)) as executor:
+        futures = [
+            executor.submit(
+                _send_create_fanout_request,
+                lane,
+                attempt=attempt + index,
+                url=url,
+                payload=payload,
+            )
+            for index, lane in enumerate(selected_lanes)
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
 
 
 def buy_stream(config: BuyConfig):
@@ -432,6 +533,154 @@ def buy_stream(config: BuyConfig):
     effective_retry_limit = max(1, int(config.create_retry_limit))
     effective_batch_size = max(1, int(config.create_request_batch_size))
     rate_limit_delay_ms = max(0, int(config.rate_limit_delay_ms))
+    queue_proxy_multiplier = max(1, int(config.queue_proxy_multiplier))
+    create_fanout_enabled = (
+        bool(config.queue_proxy_fanout_enabled) and queue_proxy_multiplier > 1
+    )
+    fanout_fill_strategy = normalize_queue_proxy_fanout_fill_strategy(
+        config.queue_proxy_fanout_fill_strategy
+    )
+    fanout_412_action = normalize_queue_proxy_fanout_412_action(
+        config.queue_proxy_fanout_412_action
+    )
+    fanout_lanes: list[_CreateFanoutLane] = []
+    fanout_cooling_lanes: list[_CoolingFanoutLane] = []
+    fanout_used_proxies: set[str] = set()
+    fanout_pool = [
+        proxy
+        for proxy in ProxyManager.parse_proxy_list(config.https_proxys)
+        if proxy.lower() != "none"
+    ]
+
+    def create_fanout_lane(proxy: str) -> _CreateFanoutLane:
+        return _CreateFanoutLane(
+            proxy=proxy,
+            request=BiliRequest(
+                cookies=cookies,
+                proxy=proxy,
+                proxy_failure_threshold=config.proxy_max_consecutive_failures,
+                proxy_cooldown_seconds=config.proxy_cooldown_seconds,
+            ),
+        )
+
+    def add_fanout_proxy(proxy: str, *, allow_direct: bool = False) -> bool:
+        normalized = ProxyManager.normalize_proxy_value(proxy)
+        if not normalized:
+            return False
+        if normalized.lower() == "none" and not allow_direct:
+            return False
+        key = normalized.lower()
+        if key in fanout_used_proxies:
+            return False
+        fanout_used_proxies.add(key)
+        fanout_lanes.append(create_fanout_lane(normalized))
+        return True
+
+    def fill_fanout_lanes(deficit: int) -> tuple[int, str | None]:
+        if deficit <= 0:
+            return 0, None
+        added = 0
+        if queue_proxy_fanout_strategy_uses_pool(fanout_fill_strategy):
+            while fanout_pool and added < deficit:
+                if add_fanout_proxy(fanout_pool.pop(0)):
+                    added += 1
+
+        if (
+            added < deficit
+            and queue_proxy_fanout_strategy_uses_api(fanout_fill_strategy)
+        ):
+            api_deficit = deficit - added
+            if not str(config.proxy_api_url or "").strip():
+                if not queue_proxy_fanout_strategy_uses_direct(fanout_fill_strategy):
+                    return added, "代理不足且未配置代理 API"
+            else:
+                try:
+                    result = fetch_proxy_api(
+                        config.proxy_api_url,
+                        count=api_deficit,
+                        protocol=config.proxy_api_protocol,
+                    )
+                except Exception as exc:
+                    logger.warning(f"代理 API 补充 fan-out 代理失败: {exc}")
+                    if not queue_proxy_fanout_strategy_uses_direct(
+                        fanout_fill_strategy
+                    ):
+                        return added, f"代理 API 补充失败: {exc}"
+                else:
+                    for proxy in result.proxies:
+                        if add_fanout_proxy(proxy):
+                            added += 1
+                            if added >= deficit:
+                                break
+
+        if (
+            added < deficit
+            and queue_proxy_fanout_strategy_uses_direct(fanout_fill_strategy)
+        ):
+            if add_fanout_proxy("none", allow_direct=True):
+                added += 1
+
+        if added < deficit:
+            return added, f"fan-out 代理补充 {added}/{deficit}，可用来源不足或重复"
+        return added, f"已补充 {added} 个 fan-out 代理"
+
+    def restore_cooling_fanout_lanes() -> int:
+        if not fanout_cooling_lanes or len(fanout_lanes) >= queue_proxy_multiplier:
+            return 0
+        now = time.time()
+        restored = 0
+        waiting: list[_CoolingFanoutLane] = []
+        for cooling_lane in fanout_cooling_lanes:
+            if len(fanout_lanes) >= queue_proxy_multiplier:
+                waiting.append(cooling_lane)
+                continue
+            if (
+                cooling_lane.ready_at <= now
+                and cooling_lane.lane.request.is_current_proxy_available()
+            ):
+                fanout_lanes.append(cooling_lane.lane)
+                restored += 1
+                continue
+            waiting.append(cooling_lane)
+        fanout_cooling_lanes[:] = waiting
+        return restored
+
+    def cooldown_fanout_lane(lane: _CreateFanoutLane) -> None:
+        lane.request.mark_current_proxy_failure("创建订单接口 412 风控")
+        fanout_cooling_lanes.append(
+            _CoolingFanoutLane(
+                lane=lane,
+                ready_at=time.time() + max(1, int(config.proxy_cooldown_seconds)),
+            )
+        )
+
+    def initialize_fanout_lanes() -> None:
+        if not create_fanout_enabled:
+            return
+        _, message = fill_fanout_lanes(queue_proxy_multiplier)
+        if message and not fanout_lanes:
+            logger.warning(message)
+
+    def replenish_fanout_lanes(deficit: int) -> tuple[int, str | None]:
+        if fanout_412_action != "replace":
+            return 0, None
+        if not str(config.proxy_api_url or "").strip():
+            return fill_fanout_lanes(deficit)
+        return fill_fanout_lanes(deficit)
+
+    def fanout_pool_status() -> str:
+        if not fanout_lanes and not fanout_cooling_lanes:
+            return "无可用 fan-out 代理"
+        active_status = [
+            ProxyManager.mask_proxy_value(lane.proxy) for lane in fanout_lanes
+        ]
+        cooling_status = [
+            f"{ProxyManager.mask_proxy_value(item.lane.proxy)}(冷却)"
+            for item in fanout_cooling_lanes
+        ]
+        return "；".join(active_status + cooling_status)
+
+    initialize_fanout_lanes()
 
     def emit_reprepare(reason: str):
         message = _format_reprepare_reason(reason)
@@ -590,138 +839,229 @@ def buy_stream(config: BuyConfig):
             token_expired = False
             terminal_result: tuple[int, dict, CreateOrderTerminalRule] | None = None
             attempt = 1
-            while attempt <= effective_retry_limit:
-                batch_end = min(
-                    attempt + effective_batch_size - 1,
-                    effective_retry_limit,
-                )
-                url, payload = _prepare_create_request(
-                    tickets_info,
-                    order_token,
-                    is_hot_project=is_hot_project,
-                    request_result=request_result,
-                    ticket_state=ticket_state,
-                )
-                while attempt <= batch_end:
+            if create_fanout_enabled:
+                if not fanout_lanes:
+                    retry_outcome.set_exception(
+                        RuntimeError("多代理抢票已启用，但当前任务没有可用代理")
+                    )
+                    yield emit(
+                        "error",
+                        "多代理抢票已启用，但当前任务没有可用代理",
+                        BuyStreamUpdate(
+                            attempt_current=attempt,
+                            attempt_total=effective_retry_limit,
+                            proxy_pool=fanout_pool_status(),
+                        ),
+                    )
+                while (fanout_lanes or fanout_cooling_lanes) and attempt <= effective_retry_limit:
                     if not isRunning:
                         yield emit("status", "抢票结束")
                         break
-                    should_sleep_before_next_attempt = False
-                    try:
-                        create_response = _request.post(
-                            url=url,
-                            data=payload,
-                            isJson=True,
+
+                    restored_count = restore_cooling_fanout_lanes()
+                    if restored_count:
+                        yield emit(
+                            "proxy",
+                            f"已恢复 {restored_count} 个冷却 fan-out 代理",
+                            BuyStreamUpdate(
+                                attempt_current=attempt,
+                                attempt_total=effective_retry_limit,
+                                proxy_pool=fanout_pool_status(),
+                            ),
                         )
-                        ret = create_response.json()
-                        proxy_backoff.reset()
-                        err = int(ret.get("errno", ret.get("code")))
-                        retry_outcome.set_response(err, ret)
-                        _request.handle_100001(err)
-                        if _is_create_success(ret, err):
+                    if not fanout_lanes:
+                        yield emit(
+                            "state",
+                            "fan-out 代理冷却中",
+                            BuyStreamUpdate(
+                                attempt_current=attempt,
+                                attempt_total=effective_retry_limit,
+                                proxy_pool=fanout_pool_status(),
+                                status="cooldown",
+                            ),
+                        )
+                        time.sleep(1)
+                        continue
+
+                    url, payload = _prepare_create_request(
+                        tickets_info,
+                        order_token,
+                        is_hot_project=is_hot_project,
+                        request_result=request_result,
+                        ticket_state=ticket_state,
+                    )
+                    fanout_results = _run_create_fanout_round(
+                        fanout_lanes,
+                        attempt=attempt,
+                        attempt_limit=effective_retry_limit,
+                        url=url,
+                        payload=payload,
+                    )
+                    if not fanout_results:
+                        break
+                    attempt += len(fanout_results)
+                    round_rate_limited = False
+                    round_should_sleep = False
+                    removed_lanes: list[_CreateFanoutLane] = []
+                    sorted_results = sorted(
+                        fanout_results,
+                        key=lambda item: item.attempt,
+                    )
+                    round_success = _find_successful_fanout_result(sorted_results)
+
+                    for fanout_result in sorted_results:
+                        fanout_attempt = fanout_result.attempt
+                        response = fanout_result.response
+                        if (
+                            response is not None
+                            and getattr(response, "status_code", None) == 412
+                        ):
+                            if fanout_result.lane not in removed_lanes:
+                                removed_lanes.append(fanout_result.lane)
+                                if fanout_412_action == "cooldown":
+                                    cooldown_fanout_lane(fanout_result.lane)
+                            retry_outcome.set_exception(
+                                fanout_result.exc
+                                or RuntimeError("创建订单接口触发 412 风控")
+                            )
                             yield emit(
-                                "success",
-                                "创建订单成功",
+                                "proxy",
+                                (
+                                    "创建订单接口触发 412 风控，"
+                                    f"{'冷却' if fanout_412_action == 'cooldown' else '丢弃'}代理 "
+                                    f"{ProxyManager.mask_proxy_value(fanout_result.lane.proxy)}"
+                                ),
                                 BuyStreamUpdate(
-                                    attempt_current=attempt,
+                                    attempt_current=fanout_attempt,
+                                    attempt_total=effective_retry_limit,
+                                    proxy_pool=fanout_pool_status(),
+                                ),
+                            )
+                            continue
+
+                        if isinstance(fanout_result.exc, BiliRateLimitError):
+                            retry_outcome.set_exception(fanout_result.exc)
+                            round_rate_limited = True
+                            yield emit(
+                                "attempt",
+                                (
+                                    f"{fanout_result.exc}，延迟 {rate_limit_delay_ms}ms 后继续"
+                                    if rate_limit_delay_ms > 0
+                                    else str(fanout_result.exc)
+                                ),
+                                BuyStreamUpdate(
+                                    attempt_current=fanout_attempt,
                                     attempt_total=effective_retry_limit,
                                 ),
                             )
-                            result = (ret, err)
-                            break
+                            continue
+
+                        if fanout_result.exc is not None:
+                            retry_outcome.set_exception(fanout_result.exc)
+                            if response is not None:
+                                diagnostic = (
+                                    fanout_result.lane.request.describe_non_json_response(
+                                        response
+                                    )
+                                )
+                                message = _summarize_non_json_response(
+                                    "创建订单接口",
+                                    diagnostic,
+                                )
+                            else:
+                                message = str(fanout_result.exc)
+                            yield emit(
+                                "attempt",
+                                message,
+                                BuyStreamUpdate(
+                                    attempt_current=fanout_attempt,
+                                    attempt_total=effective_retry_limit,
+                                ),
+                            )
+                            continue
+
+                        ret = fanout_result.ret or {}
+                        err = int(
+                            fanout_result.err if fanout_result.err is not None else -1
+                        )
+                        retry_outcome.set_response(err, ret)
+                        if round_success is None:
+                            _request.handle_100001(err)
+                        if _is_create_success(ret, err):
+                            if fanout_result is round_success and result is None:
+                                yield emit(
+                                    "success",
+                                    "创建订单成功",
+                                    BuyStreamUpdate(
+                                        attempt_current=fanout_attempt,
+                                        attempt_total=effective_retry_limit,
+                                    ),
+                                )
+                                result = (ret, err)
+                            continue
                         yield emit(
                             "attempt",
                             ErrorCodes.format_attempt_result(err, ret),
                             BuyStreamUpdate(
-                                attempt_current=attempt,
+                                attempt_current=fanout_attempt,
                                 attempt_total=effective_retry_limit,
                             ),
                         )
+                        if round_success is not None:
+                            continue
                         terminal_rule = _create_order_terminal_rule(err)
                         if terminal_rule is not None:
-                            terminal_result = (err, ret, terminal_rule)
-                            yield emit(
-                                "status",
-                                ErrorCodes.append_response_message(
-                                    err,
-                                    terminal_rule.message,
-                                    ret,
-                                ),
-                                BuyStreamUpdate(
-                                    attempt_current=attempt,
-                                    attempt_total=effective_retry_limit,
-                                    status=terminal_rule.status,
-                                ),
-                            )
-                            break
+                            if terminal_result is None:
+                                terminal_result = (err, ret, terminal_rule)
+                                yield emit(
+                                    "status",
+                                    ErrorCodes.append_response_message(
+                                        err,
+                                        terminal_rule.message,
+                                        ret,
+                                    ),
+                                    BuyStreamUpdate(
+                                        attempt_current=fanout_attempt,
+                                        attempt_total=effective_retry_limit,
+                                        status=terminal_rule.status,
+                                    ),
+                                )
+                            continue
                         if err == 100051:
-                            yield emit_reprepare("token过期")
+                            if not token_expired:
+                                yield emit_reprepare("token过期")
                             token_expired = True
-                            break
+                            continue
                         if err == 100034:
                             yield emit(
                                 "status",
                                 f"更新票价为：{ret['data']['pay_money'] / 100}",
                                 BuyStreamUpdate(
-                                    attempt_current=attempt,
+                                    attempt_current=fanout_attempt,
                                     attempt_total=effective_retry_limit,
                                 ),
                             )
                             tickets_info["pay_money"] = ret["data"]["pay_money"]
-                        should_sleep_before_next_attempt = True
-                    except JSONDecodeError as exc:
-                        handled_412 = yield from handle_non_json_response(
-                            "创建订单接口",
-                            create_response,
-                            attempt=attempt,
-                        )
-                        if not handled_412:
-                            retry_outcome.set_exception(exc)
-                    except BiliRateLimitError as e:
-                        retry_outcome.set_exception(e)
-                        yield emit(
-                            "attempt",
-                            (
-                                f"{e}，延迟 {rate_limit_delay_ms}ms 后继续"
-                                if rate_limit_delay_ms > 0
-                                else str(e)
-                            ),
-                            BuyStreamUpdate(
-                                attempt_current=attempt,
-                                attempt_total=effective_retry_limit,
-                            ),
-                        )
-                        if rate_limit_delay_ms > 0:
-                            time.sleep(rate_limit_delay_ms / 1000)
-                        continue  # 不需要sleep
-                    except RequestException as e:
-                        retry_outcome.set_exception(e)
-                        for message in handle_proxy_failure(
-                            f"创建订单请求异常({e.__class__.__name__})",
-                            attempt=attempt,
-                        ):
-                            yield message
-                        yield emit(
-                            "attempt",
-                            str(e),
-                            BuyStreamUpdate(
-                                attempt_current=attempt,
-                                attempt_total=effective_retry_limit,
-                            ),
-                        )
-                    except Exception as e:
-                        logger.exception(e)
-                        retry_outcome.set_exception(e)
-                        yield emit(
-                            "attempt",
-                            str(e),
-                            BuyStreamUpdate(
-                                attempt_current=attempt,
-                                attempt_total=effective_retry_limit,
-                            ),
-                        )
-                    finally:
-                        attempt += 1
+                        round_should_sleep = True
+
+                    if removed_lanes:
+                        fanout_lanes[:] = [
+                            lane for lane in fanout_lanes if lane not in removed_lanes
+                        ]
+                        _, replenish_message = (0, None)
+                        if result is None:
+                            _, replenish_message = replenish_fanout_lanes(
+                                len(removed_lanes)
+                            )
+                        if replenish_message:
+                            yield emit(
+                                "proxy",
+                                replenish_message,
+                                BuyStreamUpdate(
+                                    attempt_total=effective_retry_limit,
+                                    proxy_pool=fanout_pool_status(),
+                                ),
+                            )
 
                     if (
                         result is not None
@@ -729,37 +1069,215 @@ def buy_stream(config: BuyConfig):
                         or terminal_result is not None
                     ):
                         break
-                    # 按随机 create 次数主动复检项目详情（纯拉取，落在 sleep 窗口，不与 create 并发）
+                    if not fanout_lanes and not fanout_cooling_lanes:
+                        retry_outcome.set_exception(
+                            RuntimeError("多代理抢票可用代理已耗尽")
+                        )
+                        yield emit(
+                            "proxy",
+                            "多代理抢票可用代理已耗尽",
+                            BuyStreamUpdate(
+                                attempt_total=effective_retry_limit,
+                                proxy_pool=fanout_pool_status(),
+                            ),
+                        )
+                        break
+
                     if refresh_count_enabled and refresh_target is not None:
-                        refresh_counter += 1
+                        refresh_counter += len(fanout_results)
                         if refresh_counter >= refresh_target:
                             try:
                                 refresh_hot_and_warm()
                             except Exception as exc:
                                 logger.warning(f"循环内项目详情复检失败（忽略）：{exc}")
                             _reset_refresh_counter()
-                    if should_sleep_before_next_attempt:
+                    if round_rate_limited and rate_limit_delay_ms > 0:
+                        time.sleep(rate_limit_delay_ms / 1000)
+                    elif round_should_sleep:
                         time.sleep(request_interval / 1000)
 
-                if (
-                    result is not None
-                    or token_expired
-                    or terminal_result is not None
-                    or not isRunning
-                ):
-                    break
-
+                else:
+                    if config.show_random_message:
+                        yield emit("status", f"群友说👴： {get_random_fail_message()}")
+                    yield emit(
+                        "status",
+                        None,
+                        BuyStreamUpdate(
+                            attempt_total=effective_retry_limit,
+                        ),
+                    )
+                    continue
             else:
-                if config.show_random_message:
-                    yield emit("status", f"群友说👴： {get_random_fail_message()}")
-                yield emit(
-                    "status",
-                    None,
-                    BuyStreamUpdate(
-                        attempt_total=effective_retry_limit,
-                    ),
-                )
-                continue
+                while attempt <= effective_retry_limit:
+                    batch_end = min(
+                        attempt + effective_batch_size - 1,
+                        effective_retry_limit,
+                    )
+                    url, payload = _prepare_create_request(
+                        tickets_info,
+                        order_token,
+                        is_hot_project=is_hot_project,
+                        request_result=request_result,
+                        ticket_state=ticket_state,
+                    )
+                    while attempt <= batch_end:
+                        if not isRunning:
+                            yield emit("status", "抢票结束")
+                            break
+                        should_sleep_before_next_attempt = False
+                        try:
+                            create_response = _request.post(
+                                url=url,
+                                data=payload,
+                                isJson=True,
+                            )
+                            ret = create_response.json()
+                            proxy_backoff.reset()
+                            err = int(ret.get("errno", ret.get("code")))
+                            retry_outcome.set_response(err, ret)
+                            _request.handle_100001(err)
+                            if _is_create_success(ret, err):
+                                yield emit(
+                                    "success",
+                                    "创建订单成功",
+                                    BuyStreamUpdate(
+                                        attempt_current=attempt,
+                                        attempt_total=effective_retry_limit,
+                                    ),
+                                )
+                                result = (ret, err)
+                                break
+                            yield emit(
+                                "attempt",
+                                ErrorCodes.format_attempt_result(err, ret),
+                                BuyStreamUpdate(
+                                    attempt_current=attempt,
+                                    attempt_total=effective_retry_limit,
+                                ),
+                            )
+                            terminal_rule = _create_order_terminal_rule(err)
+                            if terminal_rule is not None:
+                                terminal_result = (err, ret, terminal_rule)
+                                yield emit(
+                                    "status",
+                                    ErrorCodes.append_response_message(
+                                        err,
+                                        terminal_rule.message,
+                                        ret,
+                                    ),
+                                    BuyStreamUpdate(
+                                        attempt_current=attempt,
+                                        attempt_total=effective_retry_limit,
+                                        status=terminal_rule.status,
+                                    ),
+                                )
+                                break
+                            if err == 100051:
+                                yield emit_reprepare("token过期")
+                                token_expired = True
+                                break
+                            if err == 100034:
+                                yield emit(
+                                    "status",
+                                    f"更新票价为：{ret['data']['pay_money'] / 100}",
+                                    BuyStreamUpdate(
+                                        attempt_current=attempt,
+                                        attempt_total=effective_retry_limit,
+                                    ),
+                                )
+                                tickets_info["pay_money"] = ret["data"]["pay_money"]
+                            should_sleep_before_next_attempt = True
+                        except JSONDecodeError as exc:
+                            handled_412 = yield from handle_non_json_response(
+                                "创建订单接口",
+                                create_response,
+                                attempt=attempt,
+                            )
+                            if not handled_412:
+                                retry_outcome.set_exception(exc)
+                        except BiliRateLimitError as e:
+                            retry_outcome.set_exception(e)
+                            yield emit(
+                                "attempt",
+                                (
+                                    f"{e}，延迟 {rate_limit_delay_ms}ms 后继续"
+                                    if rate_limit_delay_ms > 0
+                                    else str(e)
+                                ),
+                                BuyStreamUpdate(
+                                    attempt_current=attempt,
+                                    attempt_total=effective_retry_limit,
+                                ),
+                            )
+                            if rate_limit_delay_ms > 0:
+                                time.sleep(rate_limit_delay_ms / 1000)
+                            continue  # 不需要sleep
+                        except RequestException as e:
+                            retry_outcome.set_exception(e)
+                            for message in handle_proxy_failure(
+                                f"创建订单请求异常({e.__class__.__name__})",
+                                attempt=attempt,
+                            ):
+                                yield message
+                            yield emit(
+                                "attempt",
+                                str(e),
+                                BuyStreamUpdate(
+                                    attempt_current=attempt,
+                                    attempt_total=effective_retry_limit,
+                                ),
+                            )
+                        except Exception as e:
+                            logger.exception(e)
+                            retry_outcome.set_exception(e)
+                            yield emit(
+                                "attempt",
+                                str(e),
+                                BuyStreamUpdate(
+                                    attempt_current=attempt,
+                                    attempt_total=effective_retry_limit,
+                                ),
+                            )
+                        finally:
+                            attempt += 1
+
+                        if (
+                            result is not None
+                            or token_expired
+                            or terminal_result is not None
+                        ):
+                            break
+                        # 按随机 create 次数主动复检项目详情（纯拉取，落在 sleep 窗口，不与 create 并发）
+                        if refresh_count_enabled and refresh_target is not None:
+                            refresh_counter += 1
+                            if refresh_counter >= refresh_target:
+                                try:
+                                    refresh_hot_and_warm()
+                                except Exception as exc:
+                                    logger.warning(f"循环内项目详情复检失败（忽略）：{exc}")
+                                _reset_refresh_counter()
+                        if should_sleep_before_next_attempt:
+                            time.sleep(request_interval / 1000)
+
+                    if (
+                        result is not None
+                        or token_expired
+                        or terminal_result is not None
+                        or not isRunning
+                    ):
+                        break
+
+                else:
+                    if config.show_random_message:
+                        yield emit("status", f"群友说👴： {get_random_fail_message()}")
+                    yield emit(
+                        "status",
+                        None,
+                        BuyStreamUpdate(
+                            attempt_total=effective_retry_limit,
+                        ),
+                    )
+                    continue
             if result is None:
                 if terminal_result is not None:
                     errno, terminal_ret, terminal_rule = terminal_result
