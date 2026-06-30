@@ -320,6 +320,26 @@ def _run_create_fanout_round(
     return results
 
 
+def _mark_failed_fanout_lane(
+    lane: _CreateFanoutLane,
+    *,
+    cooling_lanes: list[_CoolingFanoutLane],
+    fanout_412_action: str,
+    cooldown_seconds: int | float,
+    reason: str,
+) -> bool:
+    if not lane.request.mark_current_proxy_failure(reason):
+        return False
+    if fanout_412_action == "cooldown":
+        cooling_lanes.append(
+            _CoolingFanoutLane(
+                lane=lane,
+                ready_at=time.time() + max(1, int(cooldown_seconds)),
+            )
+        )
+    return True
+
+
 def buy_stream(config: BuyConfig):
     state = BuyStreamState()
 
@@ -947,6 +967,22 @@ def buy_stream(config: BuyConfig):
 
                         if fanout_result.exc is not None:
                             retry_outcome.set_exception(fanout_result.exc)
+                            if isinstance(
+                                fanout_result.exc,
+                                (BiliConnectionError, RequestException),
+                            ) and fanout_result.lane not in removed_lanes:
+                                failure_reason = (
+                                    "创建订单请求异常"
+                                    f"({fanout_result.exc.__class__.__name__})"
+                                )
+                                if _mark_failed_fanout_lane(
+                                    fanout_result.lane,
+                                    cooling_lanes=fanout_cooling_lanes,
+                                    fanout_412_action=fanout_412_action,
+                                    cooldown_seconds=config.proxy_cooldown_seconds,
+                                    reason=failure_reason,
+                                ):
+                                    removed_lanes.append(fanout_result.lane)
                             if response is not None:
                                 diagnostic = (
                                     fanout_result.lane.request.describe_non_json_response(
