@@ -158,7 +158,7 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
 fi
 
 git -C "$worktree" tag "$PATCH_TAG"
-git -C "$worktree" push --atomic --force-with-lease "$origin_remote" HEAD:latest "refs/tags/$PATCH_TAG"
+git -C "$worktree" push --atomic --force-with-lease "$origin_remote" HEAD:refs/heads/latest "refs/tags/$PATCH_TAG"
 create_github_release
 
 echo "Published latest and $PATCH_TAG"
