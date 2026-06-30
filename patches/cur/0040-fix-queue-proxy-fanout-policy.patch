@@ -358,7 +358,7 @@ index 4040130..b5e77e4 100644
          auto_cleanup_logs_ui,
          log_retention_days_ui,
 diff --git a/tab/go.py b/tab/go.py
-index a011bde..d3e009f 100644
+index 0b481e0..9684039 100644
 --- a/tab/go.py
 +++ b/tab/go.py
 @@ -6,11 +6,20 @@ import threading
@@ -379,10 +379,10 @@ index a011bde..d3e009f 100644
 +    queue_proxy_fanout_strategy_uses_direct,
 +    queue_proxy_fanout_strategy_uses_pool,
 +)
- from tab.log import refresh_task_panel, render_task_manager_panel, visible_task_entries
- from task.buy import buy_new_terminal
- from util import (
-@@ -28,6 +37,133 @@ from util.Constant import (
+ from tab.log import (
+     refresh_task_panel,
+     render_task_manager_panel,
+@@ -33,6 +42,133 @@ from util.Constant import (
      DEFAULT_REQUEST_INTERVAL,
      GO_UPLOADED_FILES_STATE_KEY,
  )
@@ -516,7 +516,7 @@ index a011bde..d3e009f 100644
  
  
  def withTimeString(string):
-@@ -319,9 +455,8 @@ def go_start_tab():
+@@ -324,9 +460,8 @@ def go_start_tab():
          ConfigDB.insert("requestInterval", interval)
  
          https_proxys = ConfigDB.get("https_proxy") or ""
@@ -528,7 +528,7 @@ index a011bde..d3e009f 100644
          assigned_proxies: list[list[str]] = []
          assigned_proxies_next_idx = 0
          # 从配置文件加载
-@@ -333,6 +468,15 @@ def go_start_tab():
+@@ -338,6 +473,15 @@ def go_start_tab():
              ConfigDB.get("proxyAssignmentStrategy") or "balanced"
          ).lower()
          queue_concurrency_limit = ConfigDB.get_as_int("queueConcurrencyLimit", 0)
@@ -544,7 +544,7 @@ index a011bde..d3e009f 100644
          log_retention_days = buy_config.log_retention_days
          auto_cleanup_logs = ConfigDB.get("autoCleanupLogs")
          if auto_cleanup_logs is None:
-@@ -348,13 +492,77 @@ def go_start_tab():
+@@ -353,13 +497,77 @@ def go_start_tab():
                  max_run_dirs=ConfigDB.get_as_int("maxRunDirs", DEFAULT_MAX_RUN_DIRS),
              )
          if proxy_assignment_strategy == "queue":
@@ -626,7 +626,7 @@ index a011bde..d3e009f 100644
              def queue_worker(proxy_slot: str):
                  while True:
                      with pending_lock:
-@@ -366,6 +574,7 @@ def go_start_tab():
+@@ -371,6 +579,7 @@ def go_start_tab():
                              current_file,
                              config=buy_config.with_overrides(
                                  https_proxys=proxy_slot,
@@ -634,7 +634,7 @@ index a011bde..d3e009f 100644
                              ),
                          )
                          proc.wait()
-@@ -390,6 +599,7 @@ def go_start_tab():
+@@ -395,6 +604,7 @@ def go_start_tab():
                  filename,
                  config=buy_config.with_overrides(
                      https_proxys=",".join(assigned_proxies[assigned_proxies_next_idx]),
