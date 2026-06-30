@@ -51,10 +51,12 @@ def _build_task_log_path(filename: str) -> str:
 
 
 def _build_task_proxy_list(
-    proxy_string: str | None, *, include_direct: bool
+    proxy_string: str | None, *, include_direct: bool | None = None
 ) -> list[str]:
     proxies = ProxyManager.parse_proxy_list(proxy_string)
     proxies = [proxy for proxy in proxies if proxy.lower() != "none"]
+    if include_direct is None:
+        include_direct = not proxies
     if include_direct:
         return ["none", *proxies]
     return proxies
@@ -321,7 +323,12 @@ def go_start_tab():
         ConfigDB.insert("requestInterval", interval)
 
         https_proxys = ConfigDB.get("https_proxy") or ""
-        include_direct_proxy = ConfigDB.get_as_bool("proxyIncludeDirect", True)
+        include_direct_config = ConfigDB.get("proxyIncludeDirect")
+        include_direct_proxy = (
+            None
+            if include_direct_config is None
+            else ConfigDB.get_as_bool("proxyIncludeDirect", True)
+        )
         https_proxy_list = _build_task_proxy_list(
             https_proxys,
             include_direct=include_direct_proxy,

@@ -156,6 +156,20 @@ def test_task_proxy_list_can_require_configured_proxy():
     assert _build_task_proxy_list("", include_direct=False) == []
 
 
+def test_task_proxy_list_defaults_to_direct_only_without_configured_proxy():
+    assert _build_task_proxy_list("", include_direct=None) == ["none"]
+
+
+def test_task_proxy_list_defaults_to_configured_proxies_without_direct():
+    assert _build_task_proxy_list(
+        "none,http://127.0.0.1:18080,direct,http://127.0.0.1:28080",
+        include_direct=None,
+    ) == [
+        "http://127.0.0.1:18080",
+        "http://127.0.0.1:28080",
+    ]
+
+
 def test_runtime_strategy_flows_into_buy_config():
     runtime = build_runtime_options(
         create_request_proxy_strategy="local_fanout",
