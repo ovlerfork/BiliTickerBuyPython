@@ -197,6 +197,12 @@ def go_start_tab():
                     scale=0,
                     min_width=220,
                 )
+                auto_fill_time_delayed_btn = gr.Button(
+                    "+1s",
+                    elem_classes="btb-soft-button",
+                    scale=0,
+                    min_width=80,
+                )
 
         with gr.Row(elem_classes="btb-inline-actions !justify-end"):
             interval_ui = gr.Number(
@@ -232,7 +238,7 @@ def go_start_tab():
                 f'<div class="btb-card-note">配置预览失败：{html.escape(str(e))}</div>'
             )
 
-    def auto_fill_time(files):
+    def auto_fill_time(files, delay_seconds: int = 0):
         if not files:
             gr.Warning("请先上传至少一个抢票配置文件。")
             return ""
@@ -256,19 +262,25 @@ def go_start_tab():
 
         latest_sale_start = max(sale_start for _, sale_start in sale_start_items)
         unique_sale_starts = sorted({sale_start for _, sale_start in sale_start_items})
-        if latest_sale_start <= adjusted_now:
+        autofill_start = latest_sale_start + datetime.timedelta(seconds=delay_seconds)
+        if autofill_start <= adjusted_now:
             gr.Warning("已经过起售时间，不需要填写抢票时间。\n")
             return ""
 
-        autofill_value = latest_sale_start.strftime("%Y-%m-%dT%H:%M:%S")
+        autofill_value = autofill_start.strftime("%Y-%m-%dT%H:%M:%S")
+        delay_label = f"（晚{delay_seconds}秒）" if delay_seconds else ""
         if len(unique_sale_starts) == 1:
-            gr.Info("已自动填写抢票时间。\n")
+            gr.Info(f"已自动填写抢票时间{delay_label}。\n")
             return autofill_value
 
         gr.Warning(
-            "抢票的起始时间不一样，已自动填写为最晚的起售时间，确保所有票档届时都已开始抢票。\n"
+            "抢票的起始时间不一样，已自动填写为最晚的起售时间"
+            f"{delay_label}，确保所有票档届时都已开始抢票。\n"
         )
         return autofill_value
+
+    def auto_fill_time_delayed(files):
+        return auto_fill_time(files, delay_seconds=1)
 
     def split_proxies(https_proxy_list: list[str], task_num: int) -> list[list[str]]:
         assigned_proxies: list[list[str]] = [[] for _ in range(task_num)]
@@ -440,6 +452,24 @@ def go_start_tab():
     _auto_fill_time_tmp = gr.Textbox(visible=False)
     auto_fill_time_btn.click(
         fn=auto_fill_time,
+        inputs=upload_ui,
+        outputs=_auto_fill_time_tmp,
+    ).then(
+        fn=None,
+        inputs=_auto_fill_time_tmp,
+        outputs=_time_tmp,
+        js="""
+        (value) => {
+            const input = document.getElementById("datetime");
+            if (input) {
+                input.value = value || "";
+            }
+            return value || "";
+        }
+        """,
+    )
+    auto_fill_time_delayed_btn.click(
+        fn=auto_fill_time_delayed,
         inputs=upload_ui,
         outputs=_auto_fill_time_tmp,
     ).then(
