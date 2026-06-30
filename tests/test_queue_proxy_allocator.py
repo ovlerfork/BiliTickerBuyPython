@@ -126,6 +126,36 @@ def test_fanout_queue_pool_strategy_ignores_proxy_api_for_worker_count():
     )
 
 
+def test_fanout_queue_pool_strategy_reuses_proxy_groups_for_more_files():
+    assert (
+        _queue_worker_count(
+            file_count=5,
+            queue_concurrency_limit=0,
+            proxy_count=2,
+            fanout_enabled=True,
+            proxy_api_url="",
+            multiplier=2,
+            fill_strategy="pool",
+        )
+        == 1
+    )
+
+
+def test_fanout_queue_pool_strategy_clamps_explicit_limit_to_proxy_groups():
+    assert (
+        _queue_worker_count(
+            file_count=5,
+            queue_concurrency_limit=5,
+            proxy_count=4,
+            fanout_enabled=True,
+            proxy_api_url="",
+            multiplier=2,
+            fill_strategy="pool",
+        )
+        == 2
+    )
+
+
 def test_fanout_queue_without_api_uses_all_files_when_direct_is_allowed():
     assert (
         _queue_worker_count(
