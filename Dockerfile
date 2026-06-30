@@ -7,7 +7,6 @@ ENV TZ=Asia/Shanghai \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
-    PATH="/app/.venv/bin:${PATH}" \
     BTB_SERVER_NAME=0.0.0.0 \
     GRADIO_SERVER_PORT=7860 \
     GRADIO_NUM_PORTS=100 \
@@ -29,15 +28,10 @@ RUN apt-get update && \
     fc-cache -f && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock ./
+COPY requirements.txt ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
-
-COPY . .
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev && \
+    uv pip install --system --upgrade -r requirements.txt && \
     python - <<'PY'
 import fastapi
 import gradio
@@ -55,6 +49,7 @@ print(
 )
 PY
 
+COPY . .
 EXPOSE 7860
 
 CMD ["python", "main.py"]
