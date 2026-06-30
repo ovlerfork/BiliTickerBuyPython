@@ -1,9 +1,13 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 ENV TZ=Asia/Shanghai \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:${PATH}" \
     BTB_SERVER_NAME=0.0.0.0 \
     GRADIO_SERVER_PORT=7860 \
     GRADIO_NUM_PORTS=100 \
@@ -12,6 +16,7 @@ ENV TZ=Asia/Shanghai \
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
 WORKDIR /app
+ENV UV_INDEX_URL=${PIP_INDEX_URL}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -24,10 +29,15 @@ RUN apt-get update && \
     fc-cache -f && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
+COPY pyproject.toml uv.lock ./
 
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install --upgrade --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev && \
     python - <<'PY'
 import fastapi
 import gradio
@@ -45,7 +55,6 @@ print(
 )
 PY
 
-COPY . .
 EXPOSE 7860
 
 CMD ["python", "main.py"]
