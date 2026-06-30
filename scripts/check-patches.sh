@@ -79,6 +79,8 @@ run_if_available() {
 
 fetch_base_ref
 git -C "$root" worktree add --detach "$worktree" "$base_ref"
+git -C "$worktree" config user.name "${GIT_AUTHOR_NAME:-patch automation}"
+git -C "$worktree" config user.email "${GIT_AUTHOR_EMAIL:-patch-automation@example.invalid}"
 apply_patchset
 rm -rf "$worktree/.github/workflows"
 
