@@ -6,11 +6,20 @@ import threading
 import time
 import uuid
 
+from dataclasses import dataclass
+
 import gradio as gr
 from gradio import SelectData
 from loguru import logger
 
 from app_cmd.config.BuyConfig import BuyConfig
+from app_cmd.config.QueueProxyFanoutPolicy import (
+    QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+    normalize_queue_proxy_fanout_fill_strategy,
+    queue_proxy_fanout_strategy_uses_api,
+    queue_proxy_fanout_strategy_uses_direct,
+    queue_proxy_fanout_strategy_uses_pool,
+)
 from tab.log import (
     refresh_task_panel,
     render_task_manager_panel,
@@ -33,6 +42,133 @@ from util.Constant import (
     DEFAULT_REQUEST_INTERVAL,
     GO_UPLOADED_FILES_STATE_KEY,
 )
+from util.proxy.ProxyManager import ProxyManager
+
+
+def _real_proxy_list(proxy_text: str | None) -> list[str]:
+    return [
+        proxy
+        for proxy in ProxyManager.parse_proxy_list(proxy_text)
+        if proxy.lower() != "none"
+    ]
+
+
+@dataclass
+class QueueProxyAllocator:
+    proxies: list[str]
+    api_url: str
+    multiplier: int
+    fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT
+
+    def __post_init__(self) -> None:
+        self.multiplier = max(1, int(self.multiplier))
+        self.api_url = str(self.api_url or "").strip()
+        self.fill_strategy = normalize_queue_proxy_fanout_fill_strategy(
+            self.fill_strategy
+        )
+        self._available = list(self.proxies)
+        self._used = {proxy.lower() for proxy in self.proxies}
+        self._lock = threading.Lock()
+
+    def allocate(self) -> tuple[list[str], str | None]:
+        with self._lock:
+            if not _fanout_strategy_uses_pool(self.fill_strategy):
+                if _fanout_strategy_uses_api(self.fill_strategy) and not self.api_url:
+                    return [], "代理不足且未配置代理 API"
+                return [], None
+
+            assigned = self._take_available(self.multiplier)
+            deficit = self.multiplier - len(assigned)
+            if deficit <= 0:
+                return assigned, None
+
+            if self.fill_strategy == "pool":
+                return assigned, "代理池代理不足"
+            if _fanout_strategy_uses_api(self.fill_strategy) and self.api_url:
+                return assigned, None
+            if _fanout_strategy_uses_direct(self.fill_strategy):
+                return assigned, None
+            if _fanout_strategy_uses_api(self.fill_strategy):
+                return assigned, "代理不足且未配置代理 API"
+            return assigned, "代理池代理不足"
+
+    def _take_available(self, count: int) -> list[str]:
+        assigned: list[str] = []
+        while self._available and len(assigned) < count:
+            assigned.append(self._available.pop(0))
+        return assigned
+
+
+def _queue_worker_count(
+    *,
+    file_count: int,
+    queue_concurrency_limit: int,
+    proxy_count: int,
+    fanout_enabled: bool,
+    proxy_api_url: str,
+    multiplier: int,
+    fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+) -> int:
+    if queue_concurrency_limit > 0:
+        return max(1, min(file_count, queue_concurrency_limit))
+    fill_strategy = normalize_queue_proxy_fanout_fill_strategy(fill_strategy)
+    if (
+        fanout_enabled
+        and _fanout_strategy_uses_api(fill_strategy)
+        and str(proxy_api_url or "").strip()
+    ):
+        return max(1, file_count)
+    if fanout_enabled and _fanout_strategy_uses_direct(fill_strategy):
+        return max(1, file_count)
+    if fanout_enabled:
+        return max(1, min(file_count, max(1, proxy_count // max(1, multiplier))))
+    return max(1, min(file_count, max(1, proxy_count)))
+
+
+def _fanout_strategy_uses_pool(strategy: str) -> bool:
+    return queue_proxy_fanout_strategy_uses_pool(strategy)
+
+
+def _fanout_strategy_uses_api(strategy: str) -> bool:
+    return queue_proxy_fanout_strategy_uses_api(strategy)
+
+
+def _fanout_strategy_uses_direct(strategy: str) -> bool:
+    return queue_proxy_fanout_strategy_uses_direct(strategy)
+
+
+def _is_queue_fanout_enabled(
+    *,
+    proxy_assignment_strategy: str,
+    fanout_enabled: bool,
+    multiplier: int,
+) -> bool:
+    return (
+        str(proxy_assignment_strategy or "").lower() == "queue"
+        and bool(fanout_enabled)
+        and max(1, int(multiplier)) > 1
+    )
+
+
+def _queue_fanout_start_error(
+    *,
+    proxy_count: int,
+    multiplier: int,
+    proxy_api_url: str,
+    fill_strategy: str,
+) -> str | None:
+    multiplier = max(1, int(multiplier))
+    fill_strategy = normalize_queue_proxy_fanout_fill_strategy(fill_strategy)
+    has_api = bool(str(proxy_api_url or "").strip())
+    if fill_strategy == "api":
+        return None if has_api else "队列多代理抢票需要代理 API。"
+    if fill_strategy == "pool":
+        return None if proxy_count >= multiplier else "队列多代理抢票代理池代理不足。"
+    if fill_strategy == "pool_api":
+        if proxy_count >= multiplier or has_api:
+            return None
+        return "队列多代理抢票代理不足且未配置代理 API。"
+    return None
 
 
 def withTimeString(string):
@@ -324,9 +460,8 @@ def go_start_tab():
         ConfigDB.insert("requestInterval", interval)
 
         https_proxys = ConfigDB.get("https_proxy") or ""
-        https_proxy_list = [
-            proxy.strip() for proxy in https_proxys.split(",") if proxy.strip()
-        ] or ["none"]
+        real_proxy_list = _real_proxy_list(https_proxys)
+        https_proxy_list = real_proxy_list or ["none"]
         assigned_proxies: list[list[str]] = []
         assigned_proxies_next_idx = 0
         # 从配置文件加载
@@ -338,6 +473,15 @@ def go_start_tab():
             ConfigDB.get("proxyAssignmentStrategy") or "balanced"
         ).lower()
         queue_concurrency_limit = ConfigDB.get_as_int("queueConcurrencyLimit", 0)
+        queue_proxy_multiplier = max(1, int(buy_config.queue_proxy_multiplier))
+        queue_proxy_fanout_enabled = _is_queue_fanout_enabled(
+            proxy_assignment_strategy=proxy_assignment_strategy,
+            fanout_enabled=buy_config.queue_proxy_fanout_enabled,
+            multiplier=queue_proxy_multiplier,
+        )
+        queue_proxy_fanout_fill_strategy = normalize_queue_proxy_fanout_fill_strategy(
+            buy_config.queue_proxy_fanout_fill_strategy
+        )
         log_retention_days = buy_config.log_retention_days
         auto_cleanup_logs = ConfigDB.get("autoCleanupLogs")
         if auto_cleanup_logs is None:
@@ -353,12 +497,76 @@ def go_start_tab():
                 max_run_dirs=ConfigDB.get_as_int("maxRunDirs", DEFAULT_MAX_RUN_DIRS),
             )
         if proxy_assignment_strategy == "queue":
-            worker_count = len(https_proxy_list)
-            if queue_concurrency_limit > 0:
-                worker_count = min(worker_count, queue_concurrency_limit)
-            worker_count = max(1, min(worker_count, len(files)))
+            startup_error = None
+            if queue_proxy_fanout_enabled:
+                startup_error = _queue_fanout_start_error(
+                    proxy_count=len(real_proxy_list),
+                    multiplier=queue_proxy_multiplier,
+                    proxy_api_url=buy_config.proxy_api_url,
+                    fill_strategy=queue_proxy_fanout_fill_strategy,
+                )
+            if startup_error:
+                gr.Warning(startup_error)
+                return gr.update(visible=False)
+            worker_count = _queue_worker_count(
+                file_count=len(files),
+                queue_concurrency_limit=queue_concurrency_limit,
+                proxy_count=(
+                    len(real_proxy_list)
+                    if queue_proxy_fanout_enabled
+                    else len(https_proxy_list)
+                ),
+                fanout_enabled=queue_proxy_fanout_enabled,
+                proxy_api_url=buy_config.proxy_api_url,
+                multiplier=queue_proxy_multiplier,
+                fill_strategy=queue_proxy_fanout_fill_strategy,
+            )
             pending_files = list(files)
             pending_lock = threading.Lock()
+
+            if queue_proxy_fanout_enabled:
+                proxy_allocator = QueueProxyAllocator(
+                    proxies=real_proxy_list,
+                    api_url=buy_config.proxy_api_url,
+                    multiplier=queue_proxy_multiplier,
+                    fill_strategy=queue_proxy_fanout_fill_strategy,
+                )
+
+                def queue_worker():
+                    while True:
+                        with pending_lock:
+                            if not pending_files:
+                                return
+                            current_file = pending_files.pop(0)
+                        assigned, proxy_error = proxy_allocator.allocate()
+                        if proxy_error:
+                            logger.error(
+                                "任务 {} 未启动：{}，已分配 {}/{} 个代理",
+                                os.path.basename(current_file),
+                                proxy_error,
+                                len(assigned),
+                                queue_proxy_multiplier,
+                            )
+                            continue
+                        try:
+                            proc = launch_task(
+                                current_file,
+                                config=buy_config.with_overrides(
+                                    https_proxys=",".join(assigned) or "none",
+                                ),
+                            )
+                            proc.wait()
+                        except Exception as exc:
+                            logger.exception(exc)
+
+                for worker_idx in range(worker_count):
+                    threading.Thread(
+                        target=queue_worker,
+                        name=f"btb-queue-worker-{worker_idx + 1}",
+                        daemon=True,
+                    ).start()
+                gr.Info("抢票任务已按队列多代理模式启动。")
+                return gr.update(visible=True)
 
             def queue_worker(proxy_slot: str):
                 while True:
@@ -371,6 +579,7 @@ def go_start_tab():
                             current_file,
                             config=buy_config.with_overrides(
                                 https_proxys=proxy_slot,
+                                queue_proxy_fanout_enabled=False,
                             ),
                         )
                         proc.wait()
@@ -395,6 +604,7 @@ def go_start_tab():
                 filename,
                 config=buy_config.with_overrides(
                     https_proxys=",".join(assigned_proxies[assigned_proxies_next_idx]),
+                    queue_proxy_fanout_enabled=False,
                 ),
             )
             assigned_proxies_next_idx += 1
