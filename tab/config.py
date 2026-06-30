@@ -4,6 +4,12 @@ import gradio as gr
 from loguru import logger
 
 from app_cmd.config.BuyConfig import BuyConfig
+from app_cmd.config.QueueProxyFanoutPolicy import (
+    QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT,
+    QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
+    normalize_queue_proxy_fanout_412_action,
+    normalize_queue_proxy_fanout_fill_strategy,
+)
 from util import (
     ConfigDB,
 )
@@ -317,6 +323,28 @@ def go_settings_tab(header_ui):
         ConfigDB.insert("queueConcurrencyLimit", parsed)
         return gr.update(value=ConfigDB.get_as_int("queueConcurrencyLimit", 0))
 
+    def update_queue_proxy_fanout_enabled(value):
+        ConfigDB.insert("queueProxyFanoutEnabled", value)
+        return gr.update(value=ConfigDB.get_as_bool("queueProxyFanoutEnabled", False))
+
+    def update_queue_proxy_multiplier(value):
+        try:
+            parsed = max(1, int(value))
+        except (TypeError, ValueError):
+            parsed = 1
+        ConfigDB.insert("queueProxyMultiplier", parsed)
+        return gr.update(value=ConfigDB.get_as_int("queueProxyMultiplier", 1))
+
+    def update_queue_proxy_fanout_fill_strategy(value):
+        strategy = normalize_queue_proxy_fanout_fill_strategy(value)
+        ConfigDB.insert("queueProxyFanoutFillStrategy", strategy)
+        return gr.update(value=strategy)
+
+    def update_queue_proxy_fanout_412_action(value):
+        action = normalize_queue_proxy_fanout_412_action(value)
+        ConfigDB.insert("queueProxyFanout412Action", action)
+        return gr.update(value=action)
+
     def update_log_retention_days(value):
         return _update_positive_int_config(
             "logRetentionDays",
@@ -619,6 +647,42 @@ def go_settings_tab(header_ui):
                         step=1,
                         info="填 0 表示等于代理数量。",
                     )
+                    queue_proxy_fanout_enabled_ui = gr.Checkbox(
+                        label="队列模式启用多代理抢票",
+                        value=buy_defaults.queue_proxy_fanout_enabled,
+                        info="开启后，每个队列任务会使用多个代理并发创建订单。",
+                    )
+                    queue_proxy_multiplier_ui = gr.Number(
+                        label="每个任务代理倍率（仅队列模式）",
+                        value=buy_defaults.queue_proxy_multiplier,
+                        minimum=1,
+                        step=1,
+                        info="每个抢票任务分配多少个真实代理。代理不足时会从代理 API 补足。",
+                    )
+                    queue_proxy_fanout_fill_strategy_ui = gr.Dropdown(
+                        label="Fan-out proxy source",
+                        choices=[
+                            ("仅代理 API", "api"),
+                            ("仅代理池", "pool"),
+                            ("代理池，然后代理 API", "pool_api"),
+                            ("代理池，然后代理 API，然后直连", "pool_api_direct"),
+                        ],
+                        value=buy_defaults.queue_proxy_fanout_fill_strategy,
+                        interactive=True,
+                        allow_custom_value=False,
+                        filterable=False,
+                    )
+                    queue_proxy_fanout_412_action_ui = gr.Dropdown(
+                        label="412 handling",
+                        choices=[
+                            ("冷却后复用", "cooldown"),
+                            ("立即替换", "replace"),
+                        ],
+                        value=buy_defaults.queue_proxy_fanout_412_action,
+                        interactive=True,
+                        allow_custom_value=False,
+                        filterable=False,
+                    )
                     gr.Markdown("## 日志")
                     log_level_ui = gr.Dropdown(
                         label="日志级别",
@@ -702,7 +766,7 @@ def go_settings_tab(header_ui):
                         value=buy_defaults.rate_limit_delay_ms,
                         minimum=0,
                         step=1,
-                        info="请求返回 HTTP 429 后，等待多久再继续后续流程。默认 100ms。",
+                        info="请求返回 HTTP 429 后，等待多久再继续后续流程。默认 300ms。",
                     )
 
     save_proxy_btn.click(
@@ -806,6 +870,25 @@ def go_settings_tab(header_ui):
         queue_concurrency_limit_ui,
         update_queue_concurrency_limit,
     )
+    queue_proxy_fanout_enabled_ui.change(
+        fn=update_queue_proxy_fanout_enabled,
+        inputs=queue_proxy_fanout_enabled_ui,
+        outputs=queue_proxy_fanout_enabled_ui,
+    )
+    _bind_number_commit(
+        queue_proxy_multiplier_ui,
+        update_queue_proxy_multiplier,
+    )
+    queue_proxy_fanout_fill_strategy_ui.change(
+        fn=update_queue_proxy_fanout_fill_strategy,
+        inputs=queue_proxy_fanout_fill_strategy_ui,
+        outputs=queue_proxy_fanout_fill_strategy_ui,
+    )
+    queue_proxy_fanout_412_action_ui.change(
+        fn=update_queue_proxy_fanout_412_action,
+        inputs=queue_proxy_fanout_412_action_ui,
+        outputs=queue_proxy_fanout_412_action_ui,
+    )
     log_level_ui.change(
         fn=update_log_level,
         inputs=log_level_ui,
@@ -887,6 +970,20 @@ def go_settings_tab(header_ui):
                 value=str(ConfigDB.get("proxyAssignmentStrategy") or "balanced").lower()
             ),
             gr.update(value=ConfigDB.get_as_int("queueConcurrencyLimit", 0)),
+            gr.update(value=buy_defaults.queue_proxy_fanout_enabled),
+            gr.update(value=buy_defaults.queue_proxy_multiplier),
+            gr.update(
+                value=(
+                    buy_defaults.queue_proxy_fanout_fill_strategy
+                    or QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT
+                )
+            ),
+            gr.update(
+                value=(
+                    buy_defaults.queue_proxy_fanout_412_action
+                    or QUEUE_PROXY_FANOUT_412_ACTION_DEFAULT
+                )
+            ),
             gr.update(value=buy_defaults.log_level),
             gr.update(value=ConfigDB.get_as_bool("autoCleanupLogs", True)),
             gr.update(
@@ -928,6 +1025,10 @@ def go_settings_tab(header_ui):
         auto_open_payment_url_ui,
         proxy_assignment_strategy_ui,
         queue_concurrency_limit_ui,
+        queue_proxy_fanout_enabled_ui,
+        queue_proxy_multiplier_ui,
+        queue_proxy_fanout_fill_strategy_ui,
+        queue_proxy_fanout_412_action_ui,
         log_level_ui,
         auto_cleanup_logs_ui,
         log_retention_days_ui,
