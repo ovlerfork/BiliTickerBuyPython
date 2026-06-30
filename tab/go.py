@@ -109,20 +109,22 @@ def _queue_worker_count(
     multiplier: int,
     fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
 ) -> int:
-    if queue_concurrency_limit > 0:
-        return max(1, min(file_count, queue_concurrency_limit))
     fill_strategy = normalize_queue_proxy_fanout_fill_strategy(fill_strategy)
     if (
         fanout_enabled
         and _fanout_strategy_uses_api(fill_strategy)
         and str(proxy_api_url or "").strip()
     ):
-        return max(1, file_count)
-    if fanout_enabled and _fanout_strategy_uses_direct(fill_strategy):
-        return max(1, file_count)
-    if fanout_enabled:
-        return max(1, min(file_count, max(1, proxy_count // max(1, multiplier))))
-    return max(1, min(file_count, max(1, proxy_count)))
+        worker_count = file_count
+    elif fanout_enabled and _fanout_strategy_uses_direct(fill_strategy):
+        worker_count = file_count
+    elif fanout_enabled:
+        worker_count = min(file_count, proxy_count // max(1, multiplier))
+    else:
+        worker_count = min(file_count, max(1, proxy_count))
+    if queue_concurrency_limit > 0:
+        worker_count = min(worker_count, queue_concurrency_limit)
+    return max(0 if fanout_enabled else 1, worker_count)
 
 
 def _fanout_strategy_uses_pool(strategy: str) -> bool:
@@ -532,22 +534,26 @@ def go_start_tab():
                     fill_strategy=queue_proxy_fanout_fill_strategy,
                 )
 
-                def queue_worker():
+                worker_proxy_groups: list[list[str]] = []
+                for worker_idx in range(worker_count):
+                    assigned, proxy_error = proxy_allocator.allocate()
+                    if proxy_error:
+                        logger.error(
+                            "队列多代理 worker {} 未启动：{}，已分配 {}/{} 个代理",
+                            worker_idx + 1,
+                            proxy_error,
+                            len(assigned),
+                            queue_proxy_multiplier,
+                        )
+                        continue
+                    worker_proxy_groups.append(assigned)
+
+                def queue_worker(assigned: list[str]):
                     while True:
                         with pending_lock:
                             if not pending_files:
                                 return
                             current_file = pending_files.pop(0)
-                        assigned, proxy_error = proxy_allocator.allocate()
-                        if proxy_error:
-                            logger.error(
-                                "任务 {} 未启动：{}，已分配 {}/{} 个代理",
-                                os.path.basename(current_file),
-                                proxy_error,
-                                len(assigned),
-                                queue_proxy_multiplier,
-                            )
-                            continue
                         try:
                             proc = launch_task(
                                 current_file,
@@ -559,9 +565,10 @@ def go_start_tab():
                         except Exception as exc:
                             logger.exception(exc)
 
-                for worker_idx in range(worker_count):
+                for worker_idx, assigned in enumerate(worker_proxy_groups):
                     threading.Thread(
                         target=queue_worker,
+                        args=(assigned,),
                         name=f"btb-queue-worker-{worker_idx + 1}",
                         daemon=True,
                     ).start()
