@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: patch automation <patch-automation@example.invalid>
 Date: Tue, 30 Jun 2026 09:43:25 +0000
-Subject: [PATCH] fix: encode Bark notification path segments
+Subject: [PATCH 8/9] fix: encode Bark notification path segments
 
 
 diff --git a/tests/test_bark_util.py b/tests/test_bark_util.py

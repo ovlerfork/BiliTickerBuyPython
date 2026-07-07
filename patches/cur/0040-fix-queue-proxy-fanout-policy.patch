@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: patch automation <patch-automation@example.invalid>
 Date: Tue, 30 Jun 2026 08:11:42 +0000
-Subject: [PATCH 1/3] fix queue proxy fanout policy
+Subject: [PATCH 5/9] fix queue proxy fanout policy
 
 
 diff --git a/app_cmd/config/BuyConfig.py b/app_cmd/config/BuyConfig.py
-index 7a0fd9e..bce547d 100644
+index 74065b1..c4a0030 100644
 --- a/app_cmd/config/BuyConfig.py
 +++ b/app_cmd/config/BuyConfig.py
 @@ -1,6 +1,6 @@
@@ -27,9 +27,9 @@ index 7a0fd9e..bce547d 100644
 +    normalize_queue_proxy_fanout_fill_strategy,
 +)
  from util.Constant import DEFAULT_RATE_LIMIT_DELAY_MS
+ from util.h2client.constants import H2CLIENT_CONNECTIONS_PER_SOURCE_IP
  
- 
-@@ -88,6 +94,46 @@ class BuyConfig(BasicConfig):
+@@ -89,6 +95,46 @@ class BuyConfig(BasicConfig):
      )
      """Number of proxies requested from the API; 0 follows the current pool size."""
  
@@ -131,10 +131,10 @@ index 0000000..0f8b80c
 +def queue_proxy_fanout_strategy_uses_direct(strategy: str) -> bool:
 +    return normalize_queue_proxy_fanout_fill_strategy(strategy) == "pool_api_direct"
 diff --git a/interface/config.py b/interface/config.py
-index f742e75..e3f168e 100644
+index 50b4ffe..ae048d1 100644
 --- a/interface/config.py
 +++ b/interface/config.py
-@@ -9,6 +9,13 @@ from datetime import datetime, timedelta
+@@ -9,6 +9,12 @@ from datetime import datetime, timedelta
  from pathlib import Path
  from typing import Any
  
@@ -144,11 +144,10 @@ index f742e75..e3f168e 100644
 +    normalize_queue_proxy_fanout_412_action,
 +    normalize_queue_proxy_fanout_fill_strategy,
 +)
-+
+ from util.h2client.constants import H2CLIENT_CONNECTIONS_PER_SOURCE_IP
+ 
  from .common import (
-     BUYER_REQUIRED_FIELDS,
-     COOKIE_REQUIRED_FIELDS,
-@@ -37,6 +44,10 @@ class RuntimeOptions:
+@@ -44,6 +50,10 @@ class RuntimeOptions:
      proxy_api_url: str = ""
      proxy_api_protocol: str = "http"
      proxy_api_request_count: int = 0
@@ -159,7 +158,7 @@ index f742e75..e3f168e 100644
      serverchan3ApiUrl: str = ""
      ntfy_url: str = ""
      ntfy_username: str = ""
-@@ -202,6 +213,12 @@ def normalize_non_negative_interval(value: Any, *, default: int = 0) -> int:
+@@ -209,6 +219,12 @@ def normalize_non_negative_interval(value: Any, *, default: int = 0) -> int:
      return max(0, int(round(amount * multiplier)))
  
  
@@ -172,7 +171,7 @@ index f742e75..e3f168e 100644
  def normalize_positive_int(value: Any, *, default: int) -> int:
      if value in (None, ""):
          return default
-@@ -305,6 +322,10 @@ def build_runtime_options(
+@@ -317,6 +333,10 @@ def build_runtime_options(
      proxy_api_url: str = "",
      proxy_api_protocol: str = "http",
      proxy_api_request_count: int = 0,
@@ -183,7 +182,7 @@ index f742e75..e3f168e 100644
      serverchan3ApiUrl: str = "",
      ntfy_url: str = "",
      ntfy_username: str = "",
-@@ -344,6 +365,17 @@ def build_runtime_options(
+@@ -366,6 +386,17 @@ def build_runtime_options(
              proxy_api_request_count,
              default=0,
          ),
@@ -202,7 +201,7 @@ index f742e75..e3f168e 100644
          ntfy_url=ntfy_url,
          ntfy_username=ntfy_username,
 diff --git a/tab/config.py b/tab/config.py
-index 4040130..b5e77e4 100644
+index 3c28ac7..e545be8 100644
 --- a/tab/config.py
 +++ b/tab/config.py
 @@ -4,6 +4,12 @@ import gradio as gr
@@ -218,7 +217,7 @@ index 4040130..b5e77e4 100644
  from util import (
      ConfigDB,
  )
-@@ -317,6 +323,28 @@ def go_settings_tab(header_ui):
+@@ -347,6 +353,28 @@ def go_settings_tab(header_ui):
          ConfigDB.insert("queueConcurrencyLimit", parsed)
          return gr.update(value=ConfigDB.get_as_int("queueConcurrencyLimit", 0))
  
@@ -247,7 +246,7 @@ index 4040130..b5e77e4 100644
      def update_log_retention_days(value):
          return _update_positive_int_config(
              "logRetentionDays",
-@@ -619,6 +647,42 @@ def go_settings_tab(header_ui):
+@@ -527,6 +555,42 @@ def go_settings_tab(header_ui):
                          step=1,
                          info="填 0 表示等于代理数量。",
                      )
@@ -287,10 +286,10 @@ index 4040130..b5e77e4 100644
 +                        allow_custom_value=False,
 +                        filterable=False,
 +                    )
-                     gr.Markdown("## 日志")
-                     log_level_ui = gr.Dropdown(
-                         label="日志级别",
-@@ -702,7 +766,7 @@ def go_settings_tab(header_ui):
+                     h2_connections_per_source_ip_ui = gr.Number(
+                         label="抢票并行数",
+                         value=buy_defaults.h2_connections_per_source_ip,
+@@ -776,7 +840,7 @@ def go_settings_tab(header_ui):
                          value=buy_defaults.rate_limit_delay_ms,
                          minimum=0,
                          step=1,
@@ -299,7 +298,7 @@ index 4040130..b5e77e4 100644
                      )
  
      save_proxy_btn.click(
-@@ -806,6 +870,25 @@ def go_settings_tab(header_ui):
+@@ -900,6 +964,25 @@ def go_settings_tab(header_ui):
          queue_concurrency_limit_ui,
          update_queue_concurrency_limit,
      )
@@ -325,9 +324,9 @@ index 4040130..b5e77e4 100644
      log_level_ui.change(
          fn=update_log_level,
          inputs=log_level_ui,
-@@ -887,6 +970,20 @@ def go_settings_tab(header_ui):
-                 value=str(ConfigDB.get("proxyAssignmentStrategy") or "balanced").lower()
+@@ -989,6 +1072,20 @@ def go_settings_tab(header_ui):
              ),
+             gr.update(value=ConfigDB.get_as_bool("proxyIncludeDirect", True)),
              gr.update(value=ConfigDB.get_as_int("queueConcurrencyLimit", 0)),
 +            gr.update(value=buy_defaults.queue_proxy_fanout_enabled),
 +            gr.update(value=buy_defaults.queue_proxy_multiplier),
@@ -346,9 +345,9 @@ index 4040130..b5e77e4 100644
              gr.update(value=buy_defaults.log_level),
              gr.update(value=ConfigDB.get_as_bool("autoCleanupLogs", True)),
              gr.update(
-@@ -928,6 +1025,10 @@ def go_settings_tab(header_ui):
-         auto_open_payment_url_ui,
+@@ -1035,6 +1132,10 @@ def go_settings_tab(header_ui):
          proxy_assignment_strategy_ui,
+         proxy_include_direct_ui,
          queue_concurrency_limit_ui,
 +        queue_proxy_fanout_enabled_ui,
 +        queue_proxy_multiplier_ui,
@@ -358,11 +357,11 @@ index 4040130..b5e77e4 100644
          auto_cleanup_logs_ui,
          log_retention_days_ui,
 diff --git a/tab/go.py b/tab/go.py
-index 0b481e0..9684039 100644
+index 253943d..d1354ef 100644
 --- a/tab/go.py
 +++ b/tab/go.py
-@@ -6,11 +6,20 @@ import threading
- import time
+@@ -5,11 +5,20 @@ import os
+ import threading
  import uuid
  
 +from dataclasses import dataclass
@@ -382,13 +381,10 @@ index 0b481e0..9684039 100644
  from tab.log import (
      refresh_task_panel,
      render_task_manager_panel,
-@@ -33,6 +42,133 @@ from util.Constant import (
-     DEFAULT_REQUEST_INTERVAL,
-     GO_UPLOADED_FILES_STATE_KEY,
- )
-+from util.proxy.ProxyManager import ProxyManager
-+
-+
+@@ -35,6 +44,132 @@ from util.Constant import (
+ from util.proxy.ProxyManager import ProxyManager
+ 
+ 
 +def _real_proxy_list(proxy_text: str | None) -> list[str]:
 +    return [
 +        proxy
@@ -513,24 +509,22 @@ index 0b481e0..9684039 100644
 +            return None
 +        return "队列多代理抢票代理不足且未配置代理 API。"
 +    return None
- 
- 
++
++
  def withTimeString(string):
-@@ -324,9 +460,8 @@ def go_start_tab():
+     return (
+         f"{datetime.datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}: {string}"
+@@ -335,6 +470,7 @@ def go_start_tab():
          ConfigDB.insert("requestInterval", interval)
  
          https_proxys = ConfigDB.get("https_proxy") or ""
--        https_proxy_list = [
--            proxy.strip() for proxy in https_proxys.split(",") if proxy.strip()
--        ] or ["none"]
 +        real_proxy_list = _real_proxy_list(https_proxys)
-+        https_proxy_list = real_proxy_list or ["none"]
-         assigned_proxies: list[list[str]] = []
-         assigned_proxies_next_idx = 0
-         # 从配置文件加载
-@@ -338,6 +473,15 @@ def go_start_tab():
-             ConfigDB.get("proxyAssignmentStrategy") or "balanced"
-         ).lower()
+         include_direct_config = ConfigDB.get("proxyIncludeDirect")
+         include_direct_proxy = (
+             None
+@@ -361,6 +497,15 @@ def go_start_tab():
+         if proxy_assignment_strategy not in {"balanced", "queue", "local_fanout"}:
+             proxy_assignment_strategy = "balanced"
          queue_concurrency_limit = ConfigDB.get_as_int("queueConcurrencyLimit", 0)
 +        queue_proxy_multiplier = max(1, int(buy_config.queue_proxy_multiplier))
 +        queue_proxy_fanout_enabled = _is_queue_fanout_enabled(
@@ -544,7 +538,7 @@ index 0b481e0..9684039 100644
          log_retention_days = buy_config.log_retention_days
          auto_cleanup_logs = ConfigDB.get("autoCleanupLogs")
          if auto_cleanup_logs is None:
-@@ -353,13 +497,77 @@ def go_start_tab():
+@@ -376,13 +521,77 @@ def go_start_tab():
                  max_run_dirs=ConfigDB.get_as_int("maxRunDirs", DEFAULT_MAX_RUN_DIRS),
              )
          if proxy_assignment_strategy == "queue":
@@ -626,7 +620,7 @@ index 0b481e0..9684039 100644
              def queue_worker(proxy_slot: str):
                  while True:
                      with pending_lock:
-@@ -371,6 +579,7 @@ def go_start_tab():
+@@ -394,6 +603,7 @@ def go_start_tab():
                              current_file,
                              config=buy_config.with_overrides(
                                  https_proxys=proxy_slot,
@@ -634,7 +628,7 @@ index 0b481e0..9684039 100644
                              ),
                          )
                          proc.wait()
-@@ -395,6 +604,7 @@ def go_start_tab():
+@@ -431,6 +641,7 @@ def go_start_tab():
                  filename,
                  config=buy_config.with_overrides(
                      https_proxys=",".join(assigned_proxies[assigned_proxies_next_idx]),
@@ -643,7 +637,7 @@ index 0b481e0..9684039 100644
              )
              assigned_proxies_next_idx += 1
 diff --git a/task/buy.py b/task/buy.py
-index cbd9ec3..ff542fa 100644
+index 8c55706..548493f 100644
 --- a/task/buy.py
 +++ b/task/buy.py
 @@ -7,9 +7,11 @@ import time
@@ -672,7 +666,7 @@ index cbd9ec3..ff542fa 100644
  from interface.project import fetch_project_payload
  from util.notifer.Notifier import NotifierManager
  from util.proxy.ProxyBackoff import ProxyBackoff
-@@ -202,6 +211,98 @@ def _format_reprepare_reason(reason: str) -> str:
+@@ -206,6 +215,98 @@ def _format_reprepare_reason(reason: str) -> str:
      return f"重新准备订单，原因：{reason}"
  
  
@@ -771,7 +765,7 @@ index cbd9ec3..ff542fa 100644
  def buy_stream(config: BuyConfig):
      state = BuyStreamState()
  
-@@ -406,6 +507,154 @@ def buy_stream(config: BuyConfig):
+@@ -432,6 +533,154 @@ def buy_stream(config: BuyConfig):
      effective_retry_limit = max(1, int(config.create_retry_limit))
      effective_batch_size = max(1, int(config.create_request_batch_size))
      rate_limit_delay_ms = max(0, int(config.rate_limit_delay_ms))
@@ -926,7 +920,7 @@ index cbd9ec3..ff542fa 100644
  
      def emit_reprepare(reason: str):
          message = _format_reprepare_reason(reason)
-@@ -564,138 +813,229 @@ def buy_stream(config: BuyConfig):
+@@ -590,138 +839,229 @@ def buy_stream(config: BuyConfig):
              token_expired = False
              terminal_result: tuple[int, dict, CreateOrderTerminalRule] | None = None
              attempt = 1
@@ -1259,7 +1253,7 @@ index cbd9ec3..ff542fa 100644
  
                      if (
                          result is not None
-@@ -703,37 +1043,215 @@ def buy_stream(config: BuyConfig):
+@@ -729,37 +1069,215 @@ def buy_stream(config: BuyConfig):
                          or terminal_result is not None
                      ):
                          break

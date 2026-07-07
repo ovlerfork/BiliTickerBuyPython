@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: patch automation <patch-automation@example.invalid>
 Date: Tue, 30 Jun 2026 09:08:19 +0000
-Subject: [PATCH 3/3] fix fanout proxy failure threshold
+Subject: [PATCH 7/9] fix fanout proxy failure threshold
 
 
 diff --git a/task/buy.py b/task/buy.py
-index 4b7b384..5dcceeb 100644
+index e594943..7b41b2b 100644
 --- a/task/buy.py
 +++ b/task/buy.py
-@@ -320,6 +320,26 @@ def _run_create_fanout_round(
+@@ -324,6 +324,26 @@ def _run_create_fanout_round(
      return results
  
  
@@ -35,7 +35,7 @@ index 4b7b384..5dcceeb 100644
  def buy_stream(config: BuyConfig):
      state = BuyStreamState()
  
-@@ -947,6 +967,22 @@ def buy_stream(config: BuyConfig):
+@@ -973,6 +993,22 @@ def buy_stream(config: BuyConfig):
  
                          if fanout_result.exc is not None:
                              retry_outcome.set_exception(fanout_result.exc)

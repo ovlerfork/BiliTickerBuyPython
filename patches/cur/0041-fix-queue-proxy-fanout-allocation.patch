@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: patch automation <patch-automation@example.invalid>
 Date: Tue, 30 Jun 2026 08:41:30 +0000
-Subject: [PATCH 2/3] fix queue proxy fanout allocation
+Subject: [PATCH 6/9] fix queue proxy fanout allocation
 
 
 diff --git a/tab/go.py b/tab/go.py
-index d3e009f..201170f 100644
+index d1354ef..96518bb 100644
 --- a/tab/go.py
 +++ b/tab/go.py
-@@ -104,20 +104,22 @@ def _queue_worker_count(
+@@ -108,20 +108,22 @@ def _queue_worker_count(
      multiplier: int,
      fill_strategy: str = QUEUE_PROXY_FANOUT_FILL_STRATEGY_DEFAULT,
  ) -> int:
@@ -39,7 +39,7 @@ index d3e009f..201170f 100644
  
  
  def _fanout_strategy_uses_pool(strategy: str) -> bool:
-@@ -527,22 +529,26 @@ def go_start_tab():
+@@ -556,22 +558,26 @@ def go_start_tab():
                      fill_strategy=queue_proxy_fanout_fill_strategy,
                  )
  
@@ -77,7 +77,7 @@ index d3e009f..201170f 100644
                          try:
                              proc = launch_task(
                                  current_file,
-@@ -554,9 +560,10 @@ def go_start_tab():
+@@ -583,9 +589,10 @@ def go_start_tab():
                          except Exception as exc:
                              logger.exception(exc)
  
@@ -90,7 +90,7 @@ index d3e009f..201170f 100644
                          daemon=True,
                      ).start()
 diff --git a/task/buy.py b/task/buy.py
-index ff542fa..4b7b384 100644
+index 548493f..e594943 100644
 --- a/task/buy.py
 +++ b/task/buy.py
 @@ -17,10 +17,7 @@ import qrcode
@@ -105,7 +105,7 @@ index ff542fa..4b7b384 100644
  
  from app_cmd.config.BuyConfig import BuyConfig
  from app_cmd.config.QueueProxyFanoutPolicy import (
-@@ -233,6 +230,26 @@ class _CoolingFanoutLane:
+@@ -237,6 +234,26 @@ class _CoolingFanoutLane:
      ready_at: float
  
  
@@ -132,7 +132,7 @@ index ff542fa..4b7b384 100644
  def _find_successful_fanout_result(
      results: list[_CreateFanoutResult],
  ) -> _CreateFanoutResult | None:
-@@ -501,7 +518,7 @@ def buy_stream(config: BuyConfig):
+@@ -527,7 +544,7 @@ def buy_stream(config: BuyConfig):
      proxy_backoff = ProxyBackoff(max_seconds=config.proxy_backoff_max_seconds)
      is_hot_project = bool(tickets_info.get("is_hot_project", False))
      # use_local_token = bool(config.use_local_token)
@@ -141,7 +141,7 @@ index ff542fa..4b7b384 100644
      token_payload = _build_token_payload(tickets_info)
      request_interval = max(1, int(config.interval or 1000))
      effective_retry_limit = max(1, int(config.create_retry_limit))
-@@ -527,14 +544,12 @@ def buy_stream(config: BuyConfig):
+@@ -553,14 +570,12 @@ def buy_stream(config: BuyConfig):
      ]
  
      def create_fanout_lane(proxy: str) -> _CreateFanoutLane:

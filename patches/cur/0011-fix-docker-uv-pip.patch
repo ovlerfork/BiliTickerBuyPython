@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ovler <44089074+Ovler-Young@users.noreply.github.com>
 Date: Tue, 30 Jun 2026 11:16:17 +0000
-Subject: [PATCH] build: install Docker dependencies with uv
+Subject: [PATCH 2/9] build: install Docker dependencies with uv
 
 
 diff --git a/Dockerfile b/Dockerfile
