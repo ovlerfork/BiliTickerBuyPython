@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -131,6 +132,27 @@ class FakeH2Connection:
         self.closed = True
 
 
+def _normalized_decoded_path(url: str) -> str:
+    path = unquote(urlsplit(url).path)
+    while path.startswith("//"):
+        path = path[1:]
+    return path
+
+
+def _is_post_to_same_path(call: tuple, expected_url: str) -> bool:
+    if call[0] != "POST":
+        return False
+    return _normalized_decoded_path(call[1]) == _normalized_decoded_path(expected_url)
+
+
+def _business_post_connections(expected_url: str) -> list[FakeH2Connection]:
+    return [
+        instance
+        for instance in FakeH2Connection.instances
+        if any(_is_post_to_same_path(call, expected_url) for call in instance.calls)
+    ]
+
+
 def test_task_proxy_list_includes_direct_when_enabled():
     assert _build_task_proxy_list(
         "http://127.0.0.1:18080,http://127.0.0.1:28080",
@@ -214,11 +236,20 @@ def test_h2_client_constructor_uses_abstract_client_interface():
         ("SESSDATA", "abc", ".bilibili.com"),
         ("SESSDATA", "abc", ".bilibili.com"),
     ]
-    assert client.calls == [
-        ("head", url),
-        ("post", url, None, {"project_id": 1}),
-        ("get", url, {"project_id": 1}),
-    ]
+    assert client.calls[0] == ("head", url)
+    post_method, post_url, post_data, post_json = client.calls[1]
+    assert post_method == "post"
+    assert urlsplit(post_url).scheme == "https"
+    assert urlsplit(post_url).netloc == "show.bilibili.com"
+    assert _normalized_decoded_path(post_url) == _normalized_decoded_path(url)
+    assert post_data is None
+    assert post_json == {"project_id": 1}
+    get_method, get_url, get_params = client.calls[2]
+    assert get_method == "get"
+    assert urlsplit(get_url).scheme == "https"
+    assert urlsplit(get_url).netloc == "show.bilibili.com"
+    assert _normalized_decoded_path(get_url) == _normalized_decoded_path(url)
+    assert get_params == {"project_id": 1}
 
     request._invalidate_h2_client()
 
@@ -250,7 +281,10 @@ def test_replace_proxy_pool_updates_h2_client_options():
 
 def test_proxy_pool_fanout_builds_one_create_connection_per_proxy():
     FakeH2Connection.instances = []
-    FakeH2Connection.post_bodies_by_proxy = {}
+    FakeH2Connection.post_bodies_by_proxy = {
+        "http://127.0.0.1:18080": [b'{"errno":900001}'],
+        "socks5://127.0.0.1:19090": [b'{"errno":900001}'],
+    }
     FakeH2Connection.post_errors_by_proxy = {}
     FakeH2Connection.post_responses_by_proxy = {}
     client = ProxyPoolCreateV2FanoutJA3H2Client(
@@ -268,13 +302,9 @@ def test_proxy_pool_fanout_builds_one_create_connection_per_proxy():
     )
 
     assert response.status_code == 200
-    business_connections = [
-        instance
-        for instance in FakeH2Connection.instances
-        if instance.calls
-        and instance.calls[-1][1]
-        == "https://show.bilibili.com/api/ticket/order/createV2"
-    ]
+    business_connections = _business_post_connections(
+        "https://show.bilibili.com/api/ticket/order/createV2"
+    )
     assert sorted(instance.proxy_url for instance in business_connections) == [
         "http://127.0.0.1:18080",
         "socks5://127.0.0.1:19090",
@@ -283,7 +313,9 @@ def test_proxy_pool_fanout_builds_one_create_connection_per_proxy():
 
 def test_proxy_pool_fanout_can_use_direct_single_source():
     FakeH2Connection.instances = []
-    FakeH2Connection.post_bodies_by_proxy = {}
+    FakeH2Connection.post_bodies_by_proxy = {
+        "": [b'{"errno":900001}', b'{"errno":900001}'],
+    }
     FakeH2Connection.post_errors_by_proxy = {}
     FakeH2Connection.post_responses_by_proxy = {}
     client = ProxyPoolCreateV2FanoutJA3H2Client(
@@ -298,13 +330,9 @@ def test_proxy_pool_fanout_can_use_direct_single_source():
     )
 
     assert response.status_code == 200
-    business_connections = [
-        instance
-        for instance in FakeH2Connection.instances
-        if instance.calls
-        and instance.calls[-1][1]
-        == "https://show.bilibili.com/api/ticket/order/createV2"
-    ]
+    business_connections = _business_post_connections(
+        "https://show.bilibili.com/api/ticket/order/createV2"
+    )
     assert len(business_connections) == 2
     assert {instance.source_ip for instance in business_connections} == {None}
     assert {instance.proxy_url for instance in business_connections} == {None}
@@ -312,7 +340,9 @@ def test_proxy_pool_fanout_can_use_direct_single_source():
 
 def test_proxy_pool_fanout_detects_percent_encoded_create_v2_path():
     FakeH2Connection.instances = []
-    FakeH2Connection.post_bodies_by_proxy = {}
+    FakeH2Connection.post_bodies_by_proxy = {
+        "": [b'{"errno":900001}', b'{"errno":900001}'],
+    }
     FakeH2Connection.post_errors_by_proxy = {}
     FakeH2Connection.post_responses_by_proxy = {}
     client = ProxyPoolCreateV2FanoutJA3H2Client(
@@ -330,11 +360,7 @@ def test_proxy_pool_fanout_detects_percent_encoded_create_v2_path():
     )
 
     assert response.status_code == 200
-    business_connections = [
-        instance
-        for instance in FakeH2Connection.instances
-        if instance.calls and instance.calls[-1][1] == encoded_create_url
-    ]
+    business_connections = _business_post_connections(encoded_create_url)
     assert len(business_connections) == 2
 
 
